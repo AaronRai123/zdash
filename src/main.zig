@@ -60,6 +60,7 @@ const Operation = enum {
     sample,
     explain,
     compare,
+    doctor,
 };
 
 const RunMode = enum {
@@ -113,6 +114,8 @@ const RunOptions = struct {
     bench_kernels: bool = false,
     profile_internal: bool = false,
 };
+
+const DEFAULT_CI_REPORT_PATH = "zdash_report.json";
 
 const ProcessingConfig = struct {
     chunk_bytes: usize,
@@ -475,6 +478,13 @@ pub fn main() !void {
         };
         std.process.exit(@intFromEnum(ExitCode.ok));
     }
+    if (run_options.operation == .doctor) {
+        runDoctor(run_options.input_path, run_options.json) catch |err| {
+            try printStderr("error: doctor failed: {s}\n", .{@errorName(err)});
+            std.process.exit(@intFromEnum(ExitCode.io_error));
+        };
+        std.process.exit(@intFromEnum(ExitCode.ok));
+    }
     profilerReset(run_options.profile_internal);
     if (run_options.bench_kernels) {
         try runKernelBench();
@@ -581,8 +591,16 @@ pub fn main() !void {
     }
     if (bench) |b| try printBenchSummary(loaded, config, b);
     if (run_options.profile_internal) try printInternalProfile();
-    if (run_options.report_json_path) |report_path| {
-        try writeValidationReportJson(report_path, input_path, loaded, outcome, config, run_options.operation);
+    const report_path = blk: {
+        if (run_options.report_json_path) |path| break :blk path;
+        if (run_options.json and outcome.validation == .fail) break :blk DEFAULT_CI_REPORT_PATH;
+        break :blk null;
+    };
+    if (report_path) |path| {
+        try writeValidationReportJson(path, input_path, loaded, outcome, config, run_options.operation);
+        if (run_options.report_json_path == null and outcome.validation == .fail) {
+            try printStderr("Report written: {s}\n", .{path});
+        }
     }
 
     switch (outcome.validation) {
@@ -595,7 +613,7 @@ fn printUsage(to_stderr: bool) !void {
     if (to_stderr) {
         try printStderr(
             \\Usage:
-            \\  zdash <check|scan|stats|repair|sample|explain|compare> [options] <input>
+            \\  zdash <check|scan|stats|repair|sample|explain|compare|doctor> [options] <input>
             \\  zdash [options] <input.fastq>
             \\
             \\Options:
@@ -607,6 +625,7 @@ fn printUsage(to_stderr: bool) !void {
             \\  --json                    Emit machine-readable JSON output
             \\  --json-schema-version <v> Require an exact JSON schema version (current: 1.0.0)
             \\  --config <path>           Load defaults from config file (key=value lines)
+            \\  --ci                      CI preset alias (strict check + json + schema + annotations)
             \\  --preset <strict-ci|fast-scan|qc-only>
             \\                            Apply common developer workflow defaults
             \\  --max-errors <N>          Stop after collecting N validation errors (default: 1)
@@ -644,7 +663,7 @@ fn printUsage(to_stderr: bool) !void {
 
     try printStdout(
         \\Usage:
-        \\  zdash <check|scan|stats|repair|sample|explain|compare> [options] <input>
+        \\  zdash <check|scan|stats|repair|sample|explain|compare|doctor> [options] <input>
         \\  zdash [options] <input.fastq>
         \\
         \\Options:
@@ -656,6 +675,7 @@ fn printUsage(to_stderr: bool) !void {
         \\  --json                    Emit machine-readable JSON output
         \\  --json-schema-version <v> Require an exact JSON schema version (current: 1.0.0)
         \\  --config <path>           Load defaults from config file (key=value lines)
+        \\  --ci                      CI preset alias (strict check + json + schema + annotations)
         \\  --preset <strict-ci|fast-scan|qc-only>
         \\                            Apply common developer workflow defaults
         \\  --max-errors <N>          Stop after collecting N validation errors (default: 1)
@@ -919,9 +939,21 @@ fn applyPreset(run: *RunOptions, preset: Preset) void {
     }
 }
 
+fn applyCiDefaults(run: *RunOptions) void {
+    applyPreset(run, .strict_ci);
+    run.gha_annotations = true;
+    run.json_schema_version = JSON_SCHEMA_VERSION;
+    if (run.report_json_path == null) run.report_json_path = DEFAULT_CI_REPORT_PATH;
+    if (run.max_errors < 5) run.max_errors = 5;
+}
+
 fn applyConfigOption(run: *RunOptions, key: []const u8, value: []const u8) !void {
     if (std.mem.eql(u8, key, "preset")) {
         applyPreset(run, try parsePreset(value));
+        return;
+    }
+    if (std.mem.eql(u8, key, "ci")) {
+        if (try parseBool(value)) applyCiDefaults(run);
         return;
     }
     if (std.mem.eql(u8, key, "operation")) {
@@ -939,6 +971,8 @@ fn applyConfigOption(run: *RunOptions, key: []const u8, value: []const u8) !void
             run.operation = .explain;
         } else if (std.mem.eql(u8, value, "compare")) {
             run.operation = .compare;
+        } else if (std.mem.eql(u8, value, "doctor")) {
+            run.operation = .doctor;
         } else {
             return error.InvalidOperation;
         }
@@ -1105,6 +1139,10 @@ fn parseRunOptions(args: []const []const u8) !RunOptions {
         }
         if (std.mem.eql(u8, arg, "--json")) {
             run.json = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--ci")) {
+            applyCiDefaults(&run);
             continue;
         }
         if (std.mem.eql(u8, arg, "--json-schema-version")) {
@@ -1434,6 +1472,10 @@ fn parseRunOptions(args: []const []const u8) !RunOptions {
             run.config_path = arg["--config=".len..];
             continue;
         }
+        if (std.mem.startsWith(u8, arg, "--ci=")) {
+            try printError("error: --ci does not take a value\n");
+            return error.InvalidUsage;
+        }
         if (std.mem.startsWith(u8, arg, "--max-errors=")) {
             const value = arg["--max-errors=".len..];
             run.max_errors = parseMaxErrors(value) catch {
@@ -1552,6 +1594,11 @@ fn parseRunOptions(args: []const []const u8) !RunOptions {
             run.operation_explicit = true;
             continue;
         }
+        if (run.input_path.len == 0 and std.mem.eql(u8, arg, "doctor")) {
+            run.operation = .doctor;
+            run.operation_explicit = true;
+            continue;
+        }
 
         if (run.input_path.len != 0) {
             try printError("error: expected exactly one FASTQ input path\n");
@@ -1561,7 +1608,7 @@ fn parseRunOptions(args: []const []const u8) !RunOptions {
     }
 
     if (run.input_path.len == 0) {
-        if (run.bench_kernels) return run;
+        if (run.bench_kernels or run.operation == .doctor) return run;
         try printError("error: expected FASTQ input path\n");
         return error.InvalidUsage;
     }
@@ -1671,6 +1718,7 @@ fn resolveProcessingConfig(run: RunOptions) ProcessingConfig {
         .sample => .stats_only,
         .explain => .full,
         .compare => .full,
+        .doctor => .full,
     };
     const default_mode: RunMode = switch (run.operation) {
         .check => .strict,
@@ -1680,6 +1728,7 @@ fn resolveProcessingConfig(run: RunOptions) ProcessingConfig {
         .sample => .assume_valid,
         .explain => .strict,
         .compare => .strict,
+        .doctor => .strict,
     };
     return .{
         .chunk_bytes = run.chunk_bytes,
@@ -2308,6 +2357,71 @@ fn runCompare(allocator: std.mem.Allocator, before_path: []const u8, after_path:
             a_q - b_q,
         },
     );
+}
+
+fn runDoctor(input_path: []const u8, emit_json: bool) !void {
+    const cpu_count = std.Thread.getCpuCount() catch 1;
+    const recommended_threads = if (cpu_count == 0) @as(usize, 1) else @min(cpu_count, MAX_THREADS);
+    var tmp_ok = true;
+    const probe_path = std.fmt.allocPrint(std.heap.page_allocator, "/tmp/zdash-doctor-{d}.tmp", .{std.time.nanoTimestamp()}) catch null;
+    if (probe_path) |path| {
+        defer std.heap.page_allocator.free(path);
+        if (std.fs.createFileAbsolute(path, .{ .truncate = true })) |file| {
+            file.close();
+            std.fs.deleteFileAbsolute(path) catch {};
+        } else |_| {
+            tmp_ok = false;
+        }
+    } else {
+        tmp_ok = false;
+    }
+
+    var input_exists = false;
+    if (input_path.len > 0 and !std.mem.eql(u8, input_path, "-")) {
+        if (std.fs.cwd().access(input_path, .{})) |_| {
+            input_exists = true;
+        } else |_| {
+            input_exists = false;
+        }
+    }
+
+    if (emit_json) {
+        const payload = .{
+            .tool = "zdash",
+            .version = VERSION,
+            .schema_version = JSON_SCHEMA_VERSION,
+            .operation = "doctor",
+            .status = "ok",
+            .zig_version = builtin.zig_version_string,
+            .os = @tagName(builtin.os.tag),
+            .arch = @tagName(builtin.cpu.arch),
+            .cpu_count = cpu_count,
+            .recommended_threads = recommended_threads,
+            .tmp_write_ok = tmp_ok,
+            .input_path = if (input_path.len == 0) null else input_path,
+            .input_exists = input_exists,
+            .default_gzip_mode = "stream",
+        };
+        try printStdout("{f}\n", .{std.json.fmt(payload, .{})});
+        return;
+    }
+
+    try printStdout("Z-DASH Doctor\n", .{});
+    try printStdout("- Zig: {s}\n", .{builtin.zig_version_string});
+    try printStdout("- OS/Arch: {s}/{s}\n", .{ @tagName(builtin.os.tag), @tagName(builtin.cpu.arch) });
+    try printStdout("- CPU count: {d}\n", .{cpu_count});
+    try printStdout("- Recommended threads: {d}\n", .{recommended_threads});
+    try printStdout("- /tmp writable: {s}\n", .{if (tmp_ok) "yes" else "no"});
+    try printStdout("- Default gzip mode: stream\n", .{});
+    if (input_path.len > 0) {
+        if (std.mem.eql(u8, input_path, "-")) {
+            try printStdout("- Input path: stdin (-)\n", .{});
+        } else {
+            try printStdout("- Input path: {s} ({s})\n", .{ input_path, if (input_exists) "exists" else "missing" });
+        }
+    } else {
+        try printStdout("- Input path: not provided\n", .{});
+    }
 }
 
 fn loadInputData(allocator: std.mem.Allocator, file: std.fs.File, preference: IoPreference) !LoadedInput {
@@ -3750,6 +3864,7 @@ fn operationLabel(op: Operation) []const u8 {
         .sample => "sample",
         .explain => "explain",
         .compare => "compare",
+        .doctor => "doctor",
     };
 }
 
@@ -4198,6 +4313,23 @@ test "parse run options supports gzip mode" {
     const args = [_][]const u8{ "zdash", "--gzip-mode=temp", "in.fastq.gz" };
     const run = try parseRunOptions(&args);
     try std.testing.expect(run.gzip_mode == .temp);
+}
+
+test "parse run options supports --ci alias" {
+    const args = [_][]const u8{ "zdash", "--ci", "in.fastq" };
+    const run = try parseRunOptions(&args);
+    try std.testing.expect(run.operation == .check);
+    try std.testing.expect(run.json);
+    try std.testing.expect(run.gha_annotations);
+    try std.testing.expectEqualStrings(JSON_SCHEMA_VERSION, run.json_schema_version.?);
+    try std.testing.expectEqualStrings(DEFAULT_CI_REPORT_PATH, run.report_json_path.?);
+}
+
+test "parse run options supports doctor with no input" {
+    const args = [_][]const u8{ "zdash", "doctor" };
+    const run = try parseRunOptions(&args);
+    try std.testing.expect(run.operation == .doctor);
+    try std.testing.expectEqual(@as(usize, 0), run.input_path.len);
 }
 
 test "parse run options supports max-errors and context path" {

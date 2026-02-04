@@ -196,6 +196,7 @@ Supported options:
 - `--gha-annotations`
 - `--preset <strict-ci|fast-scan|qc-only>`, `--preset=<...>`
 - `--config <path>`, `--config=<path>`
+- `--ci`
 
 Commands:
 
@@ -206,6 +207,7 @@ Commands:
 - `sample`: deterministic FASTQ subsampling
 - `explain`: interpret JSON report failures with actionable hints
 - `compare`: diff key metrics/status fields across two reports (`--against`)
+- `doctor`: environment diagnostics and recommended runtime defaults
 
 Input path behavior:
 
@@ -213,7 +215,7 @@ Input path behavior:
 - `.gz` / `.bgz`: default in-memory stream decode then processed (`--gzip-mode temp` keeps temp-file bridge)
 - `-`: reads FASTQ from stdin into buffered memory
 
-Input path is required and must be exactly one positional argument.
+Input path is required and must be exactly one positional argument, except `doctor` (input optional).
 
 Unknown flags and malformed options return usage error (`2`).
 
@@ -231,6 +233,11 @@ Unknown flags and malformed options return usage error (`2`).
 - includes `schema_version` for compatibility checks
 - `--json-schema-version <V>` enforces exact schema-version matching and fails fast on mismatch
 - for `sample`, `--json` emits sampling summary JSON and requires `--output <path>` (cannot use `-`)
+- for validation operations, failing runs auto-write `zdash_report.json` when `--json` is used and `--report-json` is not provided
+
+`--ci` behavior:
+
+- alias for CI-safe defaults (`strict-ci` preset + JSON schema pin + GitHub annotations + report path)
 
 `--gha-annotations` behavior:
 

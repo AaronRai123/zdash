@@ -7,6 +7,7 @@ Quick production usage patterns.
 - Gate pipeline with strict validation:
   - `zdash check --json --json-schema-version 1.0.0 --report-json zdash_report.json input.fastq`
   - `zdash check --json --gha-annotations input.fastq` (for GitHub Actions logs)
+  - `zdash --ci input.fastq` (single-flag CI preset)
 - Fast health scan:
   - `zdash scan --json input.fastq.gz`
   - `zdash scan --json --gzip-mode stream input.fastq.gz`
@@ -59,6 +60,12 @@ Quick production usage patterns.
   - `--preset qc-only` (stats + assume-valid + stats-only)
 - Config file:
   - `zdash --config .zdash.example.toml input.fastq`
+
+## Doctor
+
+- Environment health check:
+  - `zdash doctor`
+  - `zdash doctor --json`
 
 ## Report Tooling
 

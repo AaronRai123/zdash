@@ -24,7 +24,7 @@ Runtime contract check:
 - `tool` (string)
 - `version` (string, binary version)
 - `schema_version` (string, JSON contract version)
-- `operation` (string: `check|scan|stats|repair|sample|explain|compare`)
+- `operation` (string: `check|scan|stats|repair|sample|explain|compare|doctor`)
 - `status` (string: `ok|failed`)
 
 ## Validation/Stats Success Payload
@@ -70,6 +70,20 @@ Additional fields:
 - `fraction` (number or null)
 - `n` (number or null)
 - `output_path` (string path; required when `--json` is used)
+
+## Doctor Success Payload
+
+Additional fields:
+
+- `zig_version`
+- `os`
+- `arch`
+- `cpu_count`
+- `recommended_threads`
+- `tmp_write_ok`
+- `input_path`
+- `input_exists`
+- `default_gzip_mode`
 
 ## Changelog Discipline
 

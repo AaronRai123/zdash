@@ -37,6 +37,7 @@ zdash check --json sample.fastq
 zdash check --report-json zdash_report.json sample.fastq
 zdash check --json --json-schema-version 1.0.0 sample.fastq
 zdash check --gha-annotations sample.fastq
+zdash --ci sample.fastq
 
 # preset + config driven runs
 zdash --preset strict-ci sample.fastq
@@ -72,6 +73,10 @@ zdash explain zdash_report.json
 
 # compare two JSON reports
 zdash compare --against after_report.json before_report.json
+
+# environment diagnostics
+zdash doctor
+zdash doctor --json
 ```
 
 Validation errors are developer-friendly:
@@ -125,6 +130,7 @@ Use `scripts/perf_validate.sh` to run a quick throughput + accuracy validation p
 - JSON outputs (`--json`, `--report-json`) follow a versioned schema.
 - See `JSON_SCHEMA.md` for compatibility guarantees and field definitions.
 - `--json-schema-version <v>` enforces an exact schema version at runtime.
+- If `--json` is used and validation fails, `zdash_report.json` is auto-written unless `--report-json` is provided.
 
 ## Data Source Support
 
