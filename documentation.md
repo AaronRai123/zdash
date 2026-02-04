@@ -24,6 +24,7 @@ The code currently implements:
 - Optional progress output
 - Kernel microbenchmark mode (`--bench-kernels`)
 - Unit and integration tests in the same source file
+- one-command wrapper (`run.sh`) for build + CI-style validation startup
 
 Primary implementation file: `src/main.zig`
 

@@ -4,6 +4,22 @@ Trust-first FASTQ tool written in Zig.
 
 Z-DASH validates FASTQ integrity, reports actionable corruption diagnostics, and computes summary stats with fast scan modes for large data.
 
+## One Command Start
+
+```bash
+./run.sh
+```
+
+That builds `zdash` and runs CI-safe validation on `tests/fixtures/valid_small.fastq`.
+
+Common variants:
+
+```bash
+./run.sh your.fastq
+./run.sh your.fastq --max-errors 10
+./run.sh doctor --json
+```
+
 ## Status
 
 Active development (pre-v1.0).  

@@ -4,6 +4,9 @@ Quick production usage patterns.
 
 ## Common Commands
 
+- One-command start:
+  - `./run.sh` (build + CI-style check on fixture)
+  - `./run.sh input.fastq` (build + CI-style check on your input)
 - Gate pipeline with strict validation:
   - `zdash check --json --json-schema-version 1.0.0 --report-json zdash_report.json input.fastq`
   - `zdash check --json --gha-annotations input.fastq` (for GitHub Actions logs)
