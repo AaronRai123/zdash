@@ -1,19 +1,19 @@
 class Zdash < Formula
   desc "Trust-first FASTQ validator and stats tool"
-  homepage "https://github.com/AaronRai123/zdash"
+  homepage "https://github.com/zdash/zdash"
   version "0.1.0"
   license "MIT"
 
   on_macos do
     if Hardware::CPU.arm?
-      url "https://github.com/AaronRai123/zdash/releases/download/v#{version}/zdash-#{version}-macos-aarch64.tar.gz"
+      url "https://github.com/zdash/zdash/releases/download/v#{version}/zdash-#{version}-macos-aarch64.tar.gz"
       sha256 "REPLACE_WITH_RELEASE_SHA256"
     end
   end
 
   on_linux do
     if Hardware::CPU.intel?
-      url "https://github.com/AaronRai123/zdash/releases/download/v#{version}/zdash-#{version}-linux-x86_64.tar.gz"
+      url "https://github.com/zdash/zdash/releases/download/v#{version}/zdash-#{version}-linux-x86_64.tar.gz"
       sha256 "REPLACE_WITH_RELEASE_SHA256"
     end
   end

@@ -25,7 +25,7 @@ Common variants:
 Fastest install path is the release installer script:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/AaronRai123/zdash/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/zdash/zdash/main/scripts/install.sh | bash
 ```
 
 After install:
@@ -38,11 +38,12 @@ cat file.fastq | zdash stats --json -
 Homebrew tap flow (after publishing release checksums into tap formula):
 
 ```bash
-brew tap AaronRai123/tap
-brew install AaronRai123/tap/zdash
+brew tap zdash/tap
+brew install zdash/tap/zdash
 ```
 
 Formula template for the tap lives in `Formula/zdash.rb`.
+Tap publishing is automated by `.github/workflows/publish-homebrew-tap.yml` (requires `HOMEBREW_TAP_TOKEN` secret).
 
 ## Status
 

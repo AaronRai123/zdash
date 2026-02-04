@@ -630,5 +630,5 @@ Project rule requested by owner:
 - Installer script: `scripts/install.sh`
   - downloads latest release archive for current platform and installs `zdash` to `$HOME/.local/bin` by default
 - Homebrew formula template: `Formula/zdash.rb`
-  - intended for `AaronRai123/tap` (`brew install AaronRai123/tap/zdash`)
-  - replace `sha256` placeholders with release artifact checksums before tap publish
+  - intended for `zdash/tap` (`brew install zdash/tap/zdash`)
+  - auto-updated by `.github/workflows/publish-homebrew-tap.yml` from release `checksums.txt`

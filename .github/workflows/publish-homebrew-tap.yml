@@ -1,0 +1,84 @@
+name: Publish Homebrew Tap
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version without leading v (e.g. 0.1.0)"
+        required: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      RELEASE_REPO: zdash/zdash
+      TAP_REPO: zdash/homebrew-tap
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve Release Version
+        id: vars
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "release" ]]; then
+            TAG="${{ github.event.release.tag_name }}"
+            VERSION="${TAG#v}"
+          else
+            VERSION="${{ github.event.inputs.version }}"
+            TAG="v${VERSION}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Download checksums.txt from release
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.vars.outputs.tag }}"
+          API="https://api.github.com/repos/${RELEASE_REPO}/releases/tags/${TAG}"
+          JSON="$(curl -fsSL "$API")"
+          CHECKSUM_URL="$(python3 -c 'import json,sys
+data=json.load(sys.stdin)
+for a in data["assets"]:
+    if a["name"] == "checksums.txt":
+        print(a["browser_download_url"])
+        break
+else:
+    raise SystemExit(1)
+' <<<"$JSON")"
+          curl -fL "$CHECKSUM_URL" -o checksums.txt
+
+      - name: Generate Formula
+        run: |
+          set -euo pipefail
+          python3 scripts/generate_homebrew_formula.py \
+            --repo "${RELEASE_REPO}" \
+            --version "${{ steps.vars.outputs.version }}" \
+            --checksums checksums.txt \
+            --out Formula/zdash.rb
+
+      - name: Push Formula to tap repository
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${TAP_TOKEN:-}" ]]; then
+            echo "HOMEBREW_TAP_TOKEN secret is required" >&2
+            exit 1
+          fi
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/${TAP_REPO}.git" tap
+          mkdir -p tap/Formula
+          cp Formula/zdash.rb tap/Formula/zdash.rb
+          cd tap
+          git config user.name "zdash-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add Formula/zdash.rb
+          if git diff --cached --quiet; then
+            echo "No formula changes to publish"
+            exit 0
+          fi
+          git commit -m "Update zdash formula to v${{ steps.vars.outputs.version }}"
+          git push origin main

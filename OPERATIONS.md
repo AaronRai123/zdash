@@ -8,7 +8,7 @@ Quick production usage patterns.
   - `./run.sh` (build + CI-style check on fixture)
   - `./run.sh input.fastq` (build + CI-style check on your input)
 - One-command install (no Zig required):
-  - `curl -fsSL https://raw.githubusercontent.com/AaronRai123/zdash/main/scripts/install.sh | bash`
+  - `curl -fsSL https://raw.githubusercontent.com/zdash/zdash/main/scripts/install.sh | bash`
 - Gate pipeline with strict validation:
   - `zdash check --json --json-schema-version 1.0.0 --report-json zdash_report.json input.fastq`
   - `zdash check --json --gha-annotations input.fastq` (for GitHub Actions logs)

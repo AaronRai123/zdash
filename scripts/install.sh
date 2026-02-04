@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO="${REPO:-AaronRai123/zdash}"
+REPO="${REPO:-zdash/zdash}"
 PREFIX="${PREFIX:-$HOME/.local/bin}"
 
 OS="$(uname -s)"
