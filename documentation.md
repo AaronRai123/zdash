@@ -164,10 +164,16 @@ Supported options:
 - `--mode=<strict|assume-valid>`
 - `--max-errors <N>`
 - `--max-errors=<N>`
+- `--error-window-reads <N>`
+- `--error-window-reads=<N>`
 - `--extract-error-context`
 - `--extract-error-context=<path>`
+- `--extract-error-debug <path>`
+- `--extract-error-debug=<path>`
 - `--report-json <path>`
 - `--report-json=<path>`
+- `--against <path>`
+- `--against=<path>`
 - `--output <path|->`
 - `--output=<path|->`
 - `--repair-mode <drop-bad-records|truncate-to-last-good>`
@@ -183,6 +189,10 @@ Supported options:
 - `--bench`
 - `--profile-internal`
 - `--json`
+- `--json-schema-version <V>`, `--json-schema-version=<V>`
+- `--gha-annotations`
+- `--preset <strict-ci|fast-scan|qc-only>`, `--preset=<...>`
+- `--config <path>`, `--config=<path>`
 
 Commands:
 
@@ -191,6 +201,8 @@ Commands:
 - `stats`: fastest summary mode (assume-valid + stats profile)
 - `repair`: rewrite FASTQ with configurable bad-record handling
 - `sample`: deterministic FASTQ subsampling
+- `explain`: interpret JSON report failures with actionable hints
+- `compare`: diff key metrics/status fields across two reports (`--against`)
 
 Input path behavior:
 
@@ -214,13 +226,31 @@ Unknown flags and malformed options return usage error (`2`).
 - emits one JSON document with status, config, and metrics/error fields
 - intended for CI and pipeline integration
 - includes `schema_version` for compatibility checks
+- `--json-schema-version <V>` enforces exact schema-version matching and fails fast on mismatch
 - for `sample`, `--json` emits sampling summary JSON and requires `--output <path>` (cannot use `-`)
+
+`--gha-annotations` behavior:
+
+- on validation failures, emits GitHub Actions `::error ...` annotations with read/byte context
+
+Preset behavior:
+
+- `strict-ci`: `check` + strict mode + full profile + JSON enabled
+- `fast-scan`: `scan` + assume-valid mode + `validate-stats` profile
+- `qc-only`: `stats` + assume-valid mode + `stats-only` profile
+
+Config behavior:
+
+- `--config <path>` loads startup defaults from simple `key=value` lines
+- CLI flags still override config values
 
 Error collection behavior:
 
 - default is fail-fast (`--max-errors 1`)
 - `--max-errors N` collects up to `N` validation failures before returning
 - `--extract-error-context[=<path>]` writes a FASTQ window around the first failure for debugging
+- `--error-window-reads <N>` controls context FASTQ window size
+- `--extract-error-debug <path>` writes a human-readable debug report with metadata and a local byte hex window
 - `--report-json <path>` writes the same summary/error JSON payload to file
 
 Repair behavior:
@@ -241,6 +271,7 @@ Sample behavior:
 - prints internal aggregated timing counters for core functions
 - reports approximate wall-time sums across threads (useful for hotspot ranking)
 - does not provide hardware counters (IPC/cycles/instructions)
+- includes framing + scheduling counters (`strictFraming`, `assumeFraming`, `newlineRefill`, `queueWait`) for optimization triage
 
 ### Exit codes
 
@@ -302,6 +333,7 @@ Current framing implementation note:
 - hot path now uses `analyzeSequenceHot` / `analyzeQualityHot` to bypass profiler wrappers in normal runs
 - hot path also issues a lightweight `@prefetch` for upcoming record starts when enough newline offsets are buffered
 - strict mode now runs primarily on newline-offset blocks (`fillTo(4)` + `peekNewline`) and only uses line-sliced parsing at chunk tails
+- strict and assume-valid paths now use profile-specialized chunk loops to remove runtime validation/low-quality branch checks in hot code
 
 ## 7. Chunked Processing
 

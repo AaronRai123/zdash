@@ -5,6 +5,14 @@ Machine: macOS (aarch64), 12 logical CPUs, Zig 0.15.2
 
 This file tracks recent competitive benchmarks and methodology.
 
+Quick local validation command (throughput + correctness):
+
+```bash
+WARMUP_RUNS=1 MEASURED_RUNS=3 scripts/perf_validate.sh data/hg002/SRR26901703_1.fastq
+```
+
+This emits p50/p90 timings + GiB/s for `check/scan/stats` and runs fixture-based accuracy checks.
+
 ## Dataset
 
 - Path: `/tmp/zdash_bench.fastq`

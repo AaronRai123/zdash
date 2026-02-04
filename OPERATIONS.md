@@ -5,7 +5,8 @@ Quick production usage patterns.
 ## Common Commands
 
 - Gate pipeline with strict validation:
-  - `zdash check --json --report-json zdash_report.json input.fastq`
+  - `zdash check --json --json-schema-version 1.0.0 --report-json zdash_report.json input.fastq`
+  - `zdash check --json --gha-annotations input.fastq` (for GitHub Actions logs)
 - Fast health scan:
   - `zdash scan --json input.fastq.gz`
 - Stats-only run:
@@ -17,6 +18,8 @@ Quick production usage patterns.
   - `zdash check --max-errors 10 input.fastq`
 - Write failure context window:
   - `zdash check --extract-error-context=error_window.fastq input.fastq`
+- Tune context window size and emit a human debug report:
+  - `zdash check --extract-error-context=error_window.fastq --error-window-reads 20 --extract-error-debug error_debug.txt input.fastq`
 - Exit code `4` means validation failure; stop downstream pipeline.
 
 ## Repair Workflows
@@ -42,3 +45,25 @@ Quick production usage patterns.
 - FASTQ file: `input.fastq`
 - gzip/bgzip: `input.fastq.gz`, `input.fastq.bgz`
 - stdin: `-` (example: `cat input.fastq | zdash stats --json -`)
+
+## Presets + Config
+
+- Presets:
+  - `--preset strict-ci` (check + strict + full + json)
+  - `--preset fast-scan` (scan + assume-valid + validate-stats)
+  - `--preset qc-only` (stats + assume-valid + stats-only)
+- Config file:
+  - `zdash --config .zdash.example.toml input.fastq`
+
+## Report Tooling
+
+- Explain failure reports:
+  - `zdash explain zdash_report.json`
+- Compare before/after report metrics:
+  - `zdash compare --against repaired_report.json original_report.json`
+
+## Speed + Accuracy Validation
+
+- Quick performance + correctness pass:
+  - `WARMUP_RUNS=1 MEASURED_RUNS=3 scripts/perf_validate.sh data/hg002/SRR26901703_1.fastq`
+- Output includes p50/p90 seconds and GiB/s for `check/scan/stats`, plus fixture-based accuracy checks.

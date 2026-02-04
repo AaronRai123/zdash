@@ -1,0 +1,13 @@
+# Z-DASH config defaults (simple key=value format)
+# Lines starting with # are ignored.
+
+# Common team preset: strict-ci | fast-scan | qc-only
+preset = strict-ci
+
+# Optional overrides
+threads = 8
+chunk_bytes = 8388608
+json = true
+gha_annotations = true
+json_schema_version = "1.0.0"
+max_errors = 10

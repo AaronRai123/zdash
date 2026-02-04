@@ -7,7 +7,8 @@ const LOW_QUALITY_AVG_Q_THRESHOLD: f64 = 20.0;
 const TARGET_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 const MAX_THREADS: usize = 256;
 const WORK_CHUNK_BATCH: usize = 8;
-const NEWLINE_BATCH_CAP: usize = 256;
+const NEWLINE_BATCH_CAP: usize = 1024;
+const NEWLINE_BATCH_MASK: usize = NEWLINE_BATCH_CAP - 1;
 const SIMD_SUGGESTED = std.simd.suggestVectorLength(u8) orelse 0;
 const SIMD_WIDTH: usize = if (SIMD_SUGGESTED >= 32) 32 else if (SIMD_SUGGESTED >= 16) 16 else 0;
 const SIMD_AVAILABLE = SIMD_WIDTH > 0;
@@ -15,6 +16,12 @@ const VALID_BASE_TABLE = buildValidBaseTable();
 const GC_BASE_TABLE = buildGcBaseTable();
 const VALID_QUALITY_TABLE = buildValidQualityTable();
 const DECODED_QUALITY_TABLE = buildDecodedQualityTable();
+
+comptime {
+    if ((NEWLINE_BATCH_CAP & NEWLINE_BATCH_MASK) != 0) {
+        @compileError("NEWLINE_BATCH_CAP must be a power of two");
+    }
+}
 
 const ExitCode = enum(u8) {
     ok = 0,
@@ -46,6 +53,8 @@ const Operation = enum {
     stats,
     repair,
     sample,
+    explain,
+    compare,
 };
 
 const RunMode = enum {
@@ -58,16 +67,30 @@ const RepairMode = enum {
     truncate_to_last_good,
 };
 
+const Preset = enum {
+    strict_ci,
+    fast_scan,
+    qc_only,
+};
+
 const RunOptions = struct {
     operation: Operation = .check,
+    operation_explicit: bool = false,
     input_path: []const u8,
     io_preference: IoPreference = .auto,
+    preset: ?Preset = null,
+    config_path: ?[]const u8 = null,
     show_progress: bool = false,
+    gha_annotations: bool = false,
     quiet: bool = false,
     json: bool = false,
+    json_schema_version: ?[]const u8 = null,
     max_errors: usize = 1,
+    error_window_reads: u64 = 5,
     extract_error_context_path: ?[]const u8 = null,
+    extract_error_debug_path: ?[]const u8 = null,
     report_json_path: ?[]const u8 = null,
+    compare_against_path: ?[]const u8 = null,
     output_path: ?[]const u8 = null,
     repair_mode: RepairMode = .drop_bad_records,
     emit_bad_records_path: ?[]const u8 = null,
@@ -193,7 +216,7 @@ const BatchedLineScanner = struct {
         if (self.newline_len >= NEWLINE_BATCH_CAP) return;
 
         const _prof_start = profileStart();
-        defer profileEnd(.read_line, _prof_start);
+        defer profileEnd(.newline_refill, _prof_start);
 
         var i = self.search_pos;
         if (SIMD_AVAILABLE and SIMD_WIDTH > 0 and self.newline_len < NEWLINE_BATCH_CAP) {
@@ -207,7 +230,7 @@ const BatchedLineScanner = struct {
                 while (lane < SIMD_WIDTH) : (lane += 1) {
                     if (!mask[lane]) continue;
                     self.newline_offsets[self.newline_head] = i + lane;
-                    self.newline_head = (self.newline_head + 1) % NEWLINE_BATCH_CAP;
+                    self.newline_head = (self.newline_head + 1) & NEWLINE_BATCH_MASK;
                     self.newline_len += 1;
                     if (self.newline_len >= NEWLINE_BATCH_CAP) {
                         self.search_pos = i + lane + 1;
@@ -220,7 +243,7 @@ const BatchedLineScanner = struct {
         while (i < self.data.len and self.newline_len < NEWLINE_BATCH_CAP) : (i += 1) {
             if (self.data[i] != '\n') continue;
             self.newline_offsets[self.newline_head] = i;
-            self.newline_head = (self.newline_head + 1) % NEWLINE_BATCH_CAP;
+            self.newline_head = (self.newline_head + 1) & NEWLINE_BATCH_MASK;
             self.newline_len += 1;
         }
         self.search_pos = i;
@@ -232,7 +255,7 @@ const BatchedLineScanner = struct {
 
         if (self.newline_len > 0) {
             const raw_end = self.newline_offsets[self.newline_tail];
-            self.newline_tail = (self.newline_tail + 1) % NEWLINE_BATCH_CAP;
+            self.newline_tail = (self.newline_tail + 1) & NEWLINE_BATCH_MASK;
             self.newline_len -= 1;
 
             const start = self.line_start;
@@ -261,12 +284,12 @@ const BatchedLineScanner = struct {
     }
 
     fn peekNewline(self: *const BatchedLineScanner, rel_index: usize) usize {
-        return self.newline_offsets[(self.newline_tail + rel_index) % NEWLINE_BATCH_CAP];
+        return self.newline_offsets[(self.newline_tail + rel_index) & NEWLINE_BATCH_MASK];
     }
 
     fn consumeRecord(self: *BatchedLineScanner) void {
-        const nl3 = self.newline_offsets[(self.newline_tail + 3) % NEWLINE_BATCH_CAP];
-        self.newline_tail = (self.newline_tail + 4) % NEWLINE_BATCH_CAP;
+        const nl3 = self.newline_offsets[(self.newline_tail + 3) & NEWLINE_BATCH_MASK];
+        self.newline_tail = (self.newline_tail + 4) & NEWLINE_BATCH_MASK;
         self.newline_len -= 4;
         self.line_start = nl3 + 1;
     }
@@ -350,7 +373,12 @@ const ChunkQueue = struct {
             const tail = self.tail.load(.acquire);
             const head = self.head.load(.acquire);
             if (tail >= head) {
-                if (self.done.load(.acquire)) return null;
+                const wait_start = profileStart();
+                if (self.done.load(.acquire)) {
+                    profileEnd(.queue_wait, wait_start);
+                    return null;
+                }
+                profileEnd(.queue_wait, wait_start);
                 std.Thread.yield() catch {};
                 continue;
             }
@@ -371,20 +399,29 @@ const ProgressState = struct {
 
 const ProfileCounter = enum(usize) {
     validate_chunk,
+    strict_framing,
+    assume_framing,
     sequence_kernel,
     quality_kernel,
-    read_line,
+    newline_refill,
+    queue_wait,
 };
 
 const InternalProfiler = struct {
     enabled: bool = false,
-    nanos: [4]std.atomic.Value(u64) = .{
+    nanos: [7]std.atomic.Value(u64) = .{
+        std.atomic.Value(u64).init(0),
+        std.atomic.Value(u64).init(0),
+        std.atomic.Value(u64).init(0),
         std.atomic.Value(u64).init(0),
         std.atomic.Value(u64).init(0),
         std.atomic.Value(u64).init(0),
         std.atomic.Value(u64).init(0),
     },
-    calls: [4]std.atomic.Value(u64) = .{
+    calls: [7]std.atomic.Value(u64) = .{
+        std.atomic.Value(u64).init(0),
+        std.atomic.Value(u64).init(0),
+        std.atomic.Value(u64).init(0),
         std.atomic.Value(u64).init(0),
         std.atomic.Value(u64).init(0),
         std.atomic.Value(u64).init(0),
@@ -417,6 +454,20 @@ pub fn main() !void {
         try printUsage(true);
         std.process.exit(@intFromEnum(ExitCode.usage_error));
     };
+    if (run_options.operation == .explain) {
+        runExplain(std.heap.page_allocator, run_options.input_path, run_options.json) catch |err| {
+            try printStderr("error: explain failed: {s}\n", .{@errorName(err)});
+            std.process.exit(@intFromEnum(ExitCode.io_error));
+        };
+        std.process.exit(@intFromEnum(ExitCode.ok));
+    }
+    if (run_options.operation == .compare) {
+        runCompare(std.heap.page_allocator, run_options.input_path, run_options.compare_against_path.?, run_options.json) catch |err| {
+            try printStderr("error: compare failed: {s}\n", .{@errorName(err)});
+            std.process.exit(@intFromEnum(ExitCode.io_error));
+        };
+        std.process.exit(@intFromEnum(ExitCode.ok));
+    }
     profilerReset(run_options.profile_internal);
     if (run_options.bench_kernels) {
         try runKernelBench();
@@ -501,6 +552,8 @@ pub fn main() !void {
             run_options.show_progress,
             run_options.max_errors,
             run_options.extract_error_context_path,
+            run_options.error_window_reads,
+            run_options.extract_error_debug_path,
         ) catch |err| {
             try printStderr("error: processing failed: {s}\n", .{@errorName(err)});
             std.process.exit(@intFromEnum(ExitCode.io_error));
@@ -514,6 +567,10 @@ pub fn main() !void {
         for (outcome.errors) |err| try printValidationFailureDetailed(loaded.bytes, err);
         if (outcome.errors.len == 0) try printValidationFailureDetailed(loaded.bytes, outcome.validation.fail);
         if (outcome.context_output_path) |p| try printStderr("Error context written: {s}\n", .{p});
+    }
+    if (run_options.gha_annotations and outcome.validation == .fail) {
+        for (outcome.errors) |err| try printGithubAnnotation(input_path, err);
+        if (outcome.errors.len == 0) try printGithubAnnotation(input_path, outcome.validation.fail);
     }
     if (bench) |b| try printBenchSummary(loaded, config, b);
     if (run_options.profile_internal) try printInternalProfile();
@@ -531,7 +588,7 @@ fn printUsage(to_stderr: bool) !void {
     if (to_stderr) {
         try printStderr(
             \\Usage:
-            \\  zdash <check|scan|stats|repair|sample> [options] <input.fastq>
+            \\  zdash <check|scan|stats|repair|sample|explain|compare> [options] <input>
             \\  zdash [options] <input.fastq>
             \\
             \\Options:
@@ -539,11 +596,20 @@ fn printUsage(to_stderr: bool) !void {
             \\  -V, --version             Show version
             \\  --progress                Show byte progress while processing
             \\  --quiet                   Suppress main summary output
+            \\  --gha-annotations         Emit GitHub Actions error annotations on validation failure
             \\  --json                    Emit machine-readable JSON output
+            \\  --json-schema-version <v> Require an exact JSON schema version (current: 1.0.0)
+            \\  --config <path>           Load defaults from config file (key=value lines)
+            \\  --preset <strict-ci|fast-scan|qc-only>
+            \\                            Apply common developer workflow defaults
             \\  --max-errors <N>          Stop after collecting N validation errors (default: 1)
+            \\  --error-window-reads <N>  Reads before/after failure for context artifact (default: 5)
             \\  --extract-error-context[=<path>]
             \\                            Write failing read window to FASTQ file
+            \\  --extract-error-debug <path>
+            \\                            Write human debug report (context + byte hex window)
             \\  --report-json <path>      Write JSON report to file
+            \\  --against <path>          Compare mode: second report/json path
             \\  --output <path|->         Output path for sample/repair (default: stdout)
             \\                            sample --json requires --output <path> (not '-')
             \\  --repair-mode <drop-bad-records|truncate-to-last-good>
@@ -569,7 +635,7 @@ fn printUsage(to_stderr: bool) !void {
 
     try printStdout(
         \\Usage:
-        \\  zdash <check|scan|stats|repair|sample> [options] <input.fastq>
+        \\  zdash <check|scan|stats|repair|sample|explain|compare> [options] <input>
         \\  zdash [options] <input.fastq>
         \\
         \\Options:
@@ -577,11 +643,20 @@ fn printUsage(to_stderr: bool) !void {
         \\  -V, --version             Show version
         \\  --progress                Show byte progress while processing
         \\  --quiet                   Suppress main summary output
+        \\  --gha-annotations         Emit GitHub Actions error annotations on validation failure
         \\  --json                    Emit machine-readable JSON output
+        \\  --json-schema-version <v> Require an exact JSON schema version (current: 1.0.0)
+        \\  --config <path>           Load defaults from config file (key=value lines)
+        \\  --preset <strict-ci|fast-scan|qc-only>
+        \\                            Apply common developer workflow defaults
         \\  --max-errors <N>          Stop after collecting N validation errors (default: 1)
+        \\  --error-window-reads <N>  Reads before/after failure for context artifact (default: 5)
         \\  --extract-error-context[=<path>]
         \\                            Write failing read window to FASTQ file
+        \\  --extract-error-debug <path>
+        \\                            Write human debug report (context + byte hex window)
         \\  --report-json <path>      Write JSON report to file
+        \\  --against <path>          Compare mode: second report/json path
         \\  --output <path|->         Output path for sample/repair (default: stdout)
         \\                            sample --json requires --output <path> (not '-')
         \\  --repair-mode <drop-bad-records|truncate-to-last-good>
@@ -782,8 +857,221 @@ fn printError(msg: []const u8) !void {
     try printStderr("{s}", .{msg});
 }
 
+fn parsePreset(value: []const u8) !Preset {
+    if (std.mem.eql(u8, value, "strict-ci")) return .strict_ci;
+    if (std.mem.eql(u8, value, "fast-scan")) return .fast_scan;
+    if (std.mem.eql(u8, value, "qc-only")) return .qc_only;
+    return error.InvalidPreset;
+}
+
+fn parseBool(value: []const u8) !bool {
+    if (std.mem.eql(u8, value, "true")) return true;
+    if (std.mem.eql(u8, value, "false")) return false;
+    return error.InvalidBoolean;
+}
+
+fn trimConfigValue(value: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, value, " \t\r");
+    if (trimmed.len >= 2) {
+        if (trimmed[0] == '"' and trimmed[trimmed.len - 1] == '"') return trimmed[1 .. trimmed.len - 1];
+        if (trimmed[0] == '\'' and trimmed[trimmed.len - 1] == '\'') return trimmed[1 .. trimmed.len - 1];
+    }
+    return trimmed;
+}
+
+fn applyPreset(run: *RunOptions, preset: Preset) void {
+    run.preset = preset;
+    run.operation_explicit = true;
+    switch (preset) {
+        .strict_ci => {
+            run.operation = .check;
+            run.mode = .strict;
+            run.mode_explicit = true;
+            run.profile = .full;
+            run.profile_explicit = true;
+            run.json = true;
+        },
+        .fast_scan => {
+            run.operation = .scan;
+            run.mode = .assume_valid;
+            run.mode_explicit = true;
+            run.profile = .validate_stats;
+            run.profile_explicit = true;
+        },
+        .qc_only => {
+            run.operation = .stats;
+            run.mode = .assume_valid;
+            run.mode_explicit = true;
+            run.profile = .stats_only;
+            run.profile_explicit = true;
+        },
+    }
+}
+
+fn applyConfigOption(run: *RunOptions, key: []const u8, value: []const u8) !void {
+    if (std.mem.eql(u8, key, "preset")) {
+        applyPreset(run, try parsePreset(value));
+        return;
+    }
+    if (std.mem.eql(u8, key, "operation")) {
+        if (std.mem.eql(u8, value, "check")) {
+            run.operation = .check;
+        } else if (std.mem.eql(u8, value, "scan")) {
+            run.operation = .scan;
+        } else if (std.mem.eql(u8, value, "stats")) {
+            run.operation = .stats;
+        } else if (std.mem.eql(u8, value, "repair")) {
+            run.operation = .repair;
+        } else if (std.mem.eql(u8, value, "sample")) {
+            run.operation = .sample;
+        } else if (std.mem.eql(u8, value, "explain")) {
+            run.operation = .explain;
+        } else if (std.mem.eql(u8, value, "compare")) {
+            run.operation = .compare;
+        } else {
+            return error.InvalidOperation;
+        }
+        run.operation_explicit = true;
+        return;
+    }
+    if (std.mem.eql(u8, key, "profile")) {
+        run.profile = try parseWorkProfile(value);
+        run.profile_explicit = true;
+        return;
+    }
+    if (std.mem.eql(u8, key, "mode")) {
+        run.mode = try parseRunMode(value);
+        run.mode_explicit = true;
+        return;
+    }
+    if (std.mem.eql(u8, key, "io_mode")) {
+        run.io_preference = try parseIoPreference(value);
+        return;
+    }
+    if (std.mem.eql(u8, key, "threads")) {
+        run.threads = try parseThreadCount(value);
+        return;
+    }
+    if (std.mem.eql(u8, key, "chunk_bytes")) {
+        run.chunk_bytes = try parseChunkBytes(value);
+        return;
+    }
+    if (std.mem.eql(u8, key, "max_errors")) {
+        run.max_errors = try parseMaxErrors(value);
+        return;
+    }
+    if (std.mem.eql(u8, key, "error_window_reads")) {
+        run.error_window_reads = try std.fmt.parseInt(u64, value, 10);
+        if (run.error_window_reads == 0) return error.InvalidWindowReads;
+        return;
+    }
+    if (std.mem.eql(u8, key, "seed")) {
+        run.sample_seed = try std.fmt.parseInt(u64, value, 10);
+        return;
+    }
+    if (std.mem.eql(u8, key, "fraction")) {
+        run.sample_fraction = try parseFraction(value);
+        return;
+    }
+    if (std.mem.eql(u8, key, "n")) {
+        run.sample_n = try parseMaxErrors(value);
+        return;
+    }
+    if (std.mem.eql(u8, key, "json")) {
+        run.json = try parseBool(value);
+        return;
+    }
+    if (std.mem.eql(u8, key, "quiet")) {
+        run.quiet = try parseBool(value);
+        return;
+    }
+    if (std.mem.eql(u8, key, "progress")) {
+        run.show_progress = try parseBool(value);
+        return;
+    }
+    if (std.mem.eql(u8, key, "gha_annotations")) {
+        run.gha_annotations = try parseBool(value);
+        return;
+    }
+    if (std.mem.eql(u8, key, "json_schema_version")) {
+        run.json_schema_version = value;
+        return;
+    }
+    if (std.mem.eql(u8, key, "report_json")) {
+        run.report_json_path = value;
+        return;
+    }
+    if (std.mem.eql(u8, key, "output")) {
+        run.output_path = value;
+        return;
+    }
+    if (std.mem.eql(u8, key, "extract_error_context")) {
+        run.extract_error_context_path = value;
+        return;
+    }
+    if (std.mem.eql(u8, key, "extract_error_debug")) {
+        run.extract_error_debug_path = value;
+        return;
+    }
+    if (std.mem.eql(u8, key, "against")) {
+        run.compare_against_path = value;
+        return;
+    }
+    if (std.mem.eql(u8, key, "repair_mode")) {
+        run.repair_mode = try parseRepairMode(value);
+        return;
+    }
+    if (std.mem.eql(u8, key, "emit_bad_records")) {
+        run.emit_bad_records_path = value;
+        return;
+    }
+    return error.UnknownConfigKey;
+}
+
+fn loadRunOptionsConfig(allocator: std.mem.Allocator, run: *RunOptions, path: []const u8) !void {
+    const bytes = try std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024);
+
+    var it = std.mem.tokenizeScalar(u8, bytes, '\n');
+    while (it.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse return error.InvalidConfigLine;
+        const key = std.mem.trim(u8, line[0..eq], " \t\r");
+        const value = trimConfigValue(line[eq + 1 ..]);
+        if (key.len == 0) return error.InvalidConfigLine;
+        try applyConfigOption(run, key, value);
+    }
+}
+
 fn parseRunOptions(args: []const []const u8) !RunOptions {
     var run = RunOptions{ .input_path = "" };
+    var config_path: ?[]const u8 = null;
+
+    var pre_i: usize = 1;
+    while (pre_i < args.len) : (pre_i += 1) {
+        const arg = args[pre_i];
+        if (std.mem.eql(u8, arg, "--config")) {
+            if (pre_i + 1 >= args.len) {
+                try printError("error: --config requires a path\n");
+                return error.InvalidUsage;
+            }
+            pre_i += 1;
+            config_path = args[pre_i];
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--config=")) {
+            config_path = arg["--config=".len..];
+            continue;
+        }
+    }
+    if (config_path) |path| {
+        run.config_path = path;
+        loadRunOptionsConfig(std.heap.page_allocator, &run, path) catch |err| {
+            try printStderr("error: failed to load config '{s}': {s}\n", .{ path, @errorName(err) });
+            return error.InvalidUsage;
+        };
+    }
+
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
@@ -796,8 +1084,43 @@ fn parseRunOptions(args: []const []const u8) !RunOptions {
             run.quiet = true;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--gha-annotations")) {
+            run.gha_annotations = true;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--json")) {
             run.json = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--json-schema-version")) {
+            if (i + 1 >= args.len) {
+                try printError("error: --json-schema-version requires a value\n");
+                return error.InvalidUsage;
+            }
+            i += 1;
+            run.json_schema_version = args[i];
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--preset")) {
+            if (i + 1 >= args.len) {
+                try printError("error: --preset requires a value\n");
+                return error.InvalidUsage;
+            }
+            i += 1;
+            const preset = parsePreset(args[i]) catch {
+                try printStderr("error: invalid preset '{s}'\n", .{args[i]});
+                return error.InvalidUsage;
+            };
+            applyPreset(&run, preset);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--config")) {
+            if (i + 1 >= args.len) {
+                try printError("error: --config requires a path\n");
+                return error.InvalidUsage;
+            }
+            i += 1;
+            run.config_path = args[i];
             continue;
         }
         if (std.mem.eql(u8, arg, "--max-errors")) {
@@ -812,6 +1135,22 @@ fn parseRunOptions(args: []const []const u8) !RunOptions {
             };
             continue;
         }
+        if (std.mem.eql(u8, arg, "--error-window-reads")) {
+            if (i + 1 >= args.len) {
+                try printError("error: --error-window-reads requires a value\n");
+                return error.InvalidUsage;
+            }
+            i += 1;
+            run.error_window_reads = std.fmt.parseInt(u64, args[i], 10) catch {
+                try printStderr("error: invalid error-window-reads '{s}'\n", .{args[i]});
+                return error.InvalidUsage;
+            };
+            if (run.error_window_reads == 0) {
+                try printError("error: --error-window-reads must be > 0\n");
+                return error.InvalidUsage;
+            }
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--extract-error-context")) {
             if (i + 1 < args.len and !std.mem.startsWith(u8, args[i + 1], "-")) {
                 i += 1;
@@ -821,6 +1160,15 @@ fn parseRunOptions(args: []const []const u8) !RunOptions {
             }
             continue;
         }
+        if (std.mem.eql(u8, arg, "--extract-error-debug")) {
+            if (i + 1 >= args.len) {
+                try printError("error: --extract-error-debug requires a path\n");
+                return error.InvalidUsage;
+            }
+            i += 1;
+            run.extract_error_debug_path = args[i];
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--report-json")) {
             if (i + 1 >= args.len) {
                 try printError("error: --report-json requires a path\n");
@@ -828,6 +1176,15 @@ fn parseRunOptions(args: []const []const u8) !RunOptions {
             }
             i += 1;
             run.report_json_path = args[i];
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--against")) {
+            if (i + 1 >= args.len) {
+                try printError("error: --against requires a path\n");
+                return error.InvalidUsage;
+            }
+            i += 1;
+            run.compare_against_path = args[i];
             continue;
         }
         if (std.mem.eql(u8, arg, "--output")) {
@@ -1025,6 +1382,23 @@ fn parseRunOptions(args: []const []const u8) !RunOptions {
             run.mode_explicit = true;
             continue;
         }
+        if (std.mem.startsWith(u8, arg, "--preset=")) {
+            const value = arg["--preset=".len..];
+            const preset = parsePreset(value) catch {
+                try printStderr("error: invalid preset '{s}'\n", .{value});
+                return error.InvalidUsage;
+            };
+            applyPreset(&run, preset);
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--json-schema-version=")) {
+            run.json_schema_version = arg["--json-schema-version=".len..];
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--config=")) {
+            run.config_path = arg["--config=".len..];
+            continue;
+        }
         if (std.mem.startsWith(u8, arg, "--max-errors=")) {
             const value = arg["--max-errors=".len..];
             run.max_errors = parseMaxErrors(value) catch {
@@ -1033,13 +1407,33 @@ fn parseRunOptions(args: []const []const u8) !RunOptions {
             };
             continue;
         }
+        if (std.mem.startsWith(u8, arg, "--error-window-reads=")) {
+            const value = arg["--error-window-reads=".len..];
+            run.error_window_reads = std.fmt.parseInt(u64, value, 10) catch {
+                try printStderr("error: invalid error-window-reads '{s}'\n", .{value});
+                return error.InvalidUsage;
+            };
+            if (run.error_window_reads == 0) {
+                try printError("error: --error-window-reads must be > 0\n");
+                return error.InvalidUsage;
+            }
+            continue;
+        }
         if (std.mem.startsWith(u8, arg, "--extract-error-context=")) {
             const value = arg["--extract-error-context=".len..];
             run.extract_error_context_path = value;
             continue;
         }
+        if (std.mem.startsWith(u8, arg, "--extract-error-debug=")) {
+            run.extract_error_debug_path = arg["--extract-error-debug=".len..];
+            continue;
+        }
         if (std.mem.startsWith(u8, arg, "--report-json=")) {
             run.report_json_path = arg["--report-json=".len..];
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--against=")) {
+            run.compare_against_path = arg["--against=".len..];
             continue;
         }
         if (std.mem.startsWith(u8, arg, "--output=")) {
@@ -1090,22 +1484,37 @@ fn parseRunOptions(args: []const []const u8) !RunOptions {
 
         if (run.input_path.len == 0 and std.mem.eql(u8, arg, "check")) {
             run.operation = .check;
+            run.operation_explicit = true;
             continue;
         }
         if (run.input_path.len == 0 and std.mem.eql(u8, arg, "scan")) {
             run.operation = .scan;
+            run.operation_explicit = true;
             continue;
         }
         if (run.input_path.len == 0 and std.mem.eql(u8, arg, "stats")) {
             run.operation = .stats;
+            run.operation_explicit = true;
             continue;
         }
         if (run.input_path.len == 0 and std.mem.eql(u8, arg, "repair")) {
             run.operation = .repair;
+            run.operation_explicit = true;
             continue;
         }
         if (run.input_path.len == 0 and std.mem.eql(u8, arg, "sample")) {
             run.operation = .sample;
+            run.operation_explicit = true;
+            continue;
+        }
+        if (run.input_path.len == 0 and std.mem.eql(u8, arg, "explain")) {
+            run.operation = .explain;
+            run.operation_explicit = true;
+            continue;
+        }
+        if (run.input_path.len == 0 and std.mem.eql(u8, arg, "compare")) {
+            run.operation = .compare;
+            run.operation_explicit = true;
             continue;
         }
 
@@ -1137,6 +1546,23 @@ fn parseRunOptions(args: []const []const u8) !RunOptions {
                 try printError("error: sample --json requires --output to be a file path (not '-')\n");
                 return error.InvalidUsage;
             }
+        }
+    }
+    if (run.operation == .compare and run.compare_against_path == null) {
+        try printError("error: compare requires --against <path>\n");
+        return error.InvalidUsage;
+    }
+    if (run.operation == .explain and run.compare_against_path != null) {
+        try printError("error: --against is only valid with compare\n");
+        return error.InvalidUsage;
+    }
+    if (run.json_schema_version) |version| {
+        if (!std.mem.eql(u8, version, JSON_SCHEMA_VERSION)) {
+            try printStderr(
+                "error: unsupported json schema version '{s}' (supported: {s})\n",
+                .{ version, JSON_SCHEMA_VERSION },
+            );
+            return error.InvalidUsage;
         }
     }
 
@@ -1202,6 +1628,8 @@ fn resolveProcessingConfig(run: RunOptions) ProcessingConfig {
         .stats => .stats_only,
         .repair => .full,
         .sample => .stats_only,
+        .explain => .full,
+        .compare => .full,
     };
     const default_mode: RunMode = switch (run.operation) {
         .check => .strict,
@@ -1209,6 +1637,8 @@ fn resolveProcessingConfig(run: RunOptions) ProcessingConfig {
         .stats => .assume_valid,
         .repair => .strict,
         .sample => .assume_valid,
+        .explain => .strict,
+        .compare => .strict,
     };
     return .{
         .chunk_bytes = run.chunk_bytes,
@@ -1386,9 +1816,12 @@ fn profileEnd(counter: ProfileCounter, start_ns: i128) void {
 fn printInternalProfile() !void {
     var items = [_]struct { name: []const u8, ns: u64, calls: u64 }{
         .{ .name = "validateFastqChunk", .ns = g_profiler.nanos[@intFromEnum(ProfileCounter.validate_chunk)].load(.monotonic), .calls = g_profiler.calls[@intFromEnum(ProfileCounter.validate_chunk)].load(.monotonic) },
+        .{ .name = "strictFraming", .ns = g_profiler.nanos[@intFromEnum(ProfileCounter.strict_framing)].load(.monotonic), .calls = g_profiler.calls[@intFromEnum(ProfileCounter.strict_framing)].load(.monotonic) },
+        .{ .name = "assumeFraming", .ns = g_profiler.nanos[@intFromEnum(ProfileCounter.assume_framing)].load(.monotonic), .calls = g_profiler.calls[@intFromEnum(ProfileCounter.assume_framing)].load(.monotonic) },
         .{ .name = "analyzeSequenceKernel", .ns = g_profiler.nanos[@intFromEnum(ProfileCounter.sequence_kernel)].load(.monotonic), .calls = g_profiler.calls[@intFromEnum(ProfileCounter.sequence_kernel)].load(.monotonic) },
         .{ .name = "analyzeQualityKernel", .ns = g_profiler.nanos[@intFromEnum(ProfileCounter.quality_kernel)].load(.monotonic), .calls = g_profiler.calls[@intFromEnum(ProfileCounter.quality_kernel)].load(.monotonic) },
-        .{ .name = "readLine", .ns = g_profiler.nanos[@intFromEnum(ProfileCounter.read_line)].load(.monotonic), .calls = g_profiler.calls[@intFromEnum(ProfileCounter.read_line)].load(.monotonic) },
+        .{ .name = "newlineRefill", .ns = g_profiler.nanos[@intFromEnum(ProfileCounter.newline_refill)].load(.monotonic), .calls = g_profiler.calls[@intFromEnum(ProfileCounter.newline_refill)].load(.monotonic) },
+        .{ .name = "queueWait", .ns = g_profiler.nanos[@intFromEnum(ProfileCounter.queue_wait)].load(.monotonic), .calls = g_profiler.calls[@intFromEnum(ProfileCounter.queue_wait)].load(.monotonic) },
     };
     std.sort.insertion(
         @TypeOf(items[0]),
@@ -1402,8 +1835,10 @@ fn printInternalProfile() !void {
     );
 
     try printStdout("\nInternal Profile (approx wall-time):\n", .{});
-    const total: u64 = items[0].ns + items[1].ns + items[2].ns + items[3].ns;
-    for (items[0..3]) |it| {
+    var total: u64 = 0;
+    for (items) |it| total += it.ns;
+    for (items) |it| {
+        if (it.ns == 0) continue;
         const pct = if (total == 0) 0.0 else (@as(f64, @floatFromInt(it.ns)) * 100.0) / @as(f64, @floatFromInt(total));
         try printStdout("- {s}: {d:.3}s ({d:.1}%), calls={d}\n", .{
             it.name,
@@ -1660,6 +2095,150 @@ fn writeValidationReportJson(
     try f.writeAll("\n");
 }
 
+fn jsonGet(value: std.json.Value, key: []const u8) ?std.json.Value {
+    if (value != .object) return null;
+    return value.object.get(key);
+}
+
+fn jsonString(value: std.json.Value) ?[]const u8 {
+    return switch (value) {
+        .string => |s| s,
+        else => null,
+    };
+}
+
+fn jsonNumber(value: std.json.Value) ?f64 {
+    return switch (value) {
+        .integer => |n| @as(f64, @floatFromInt(n)),
+        .float => |f| f,
+        else => null,
+    };
+}
+
+fn inferFailureHint(message: []const u8) []const u8 {
+    if (std.mem.indexOf(u8, message, "truncated") != null) return "Likely incomplete upload/write or stream truncation. Re-fetch or regenerate the file.";
+    if (std.mem.indexOf(u8, message, "invalid base") != null) return "Sequence has non-ACGTN bytes. Validate upstream conversion and text encoding.";
+    if (std.mem.indexOf(u8, message, "invalid quality") != null) return "Quality line includes non-Phred+33 printable bytes. Check pipeline encoding assumptions.";
+    if (std.mem.indexOf(u8, message, "length mismatch") != null) return "Sequence and quality lengths differ. Upstream read framing is corrupted.";
+    if (std.mem.indexOf(u8, message, "header") != null or std.mem.indexOf(u8, message, "separator") != null) return "FASTQ framing markers (@/+) are malformed. Check record boundaries.";
+    return "Inspect the first failing read and upstream preprocessing for record damage.";
+}
+
+fn runExplain(allocator: std.mem.Allocator, report_path: []const u8, emit_json: bool) !void {
+    const bytes = try std.fs.cwd().readFileAlloc(allocator, report_path, 8 * 1024 * 1024);
+    defer allocator.free(bytes);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    defer parsed.deinit();
+
+    const root = parsed.value;
+    const status = if (jsonGet(root, "status")) |v| jsonString(v) orelse "unknown" else "unknown";
+    const operation = if (jsonGet(root, "operation")) |v| jsonString(v) orelse "unknown" else "unknown";
+    const schema = if (jsonGet(root, "schema_version")) |v| jsonString(v) orelse "unknown" else "unknown";
+    const input = if (jsonGet(root, "input")) |v| jsonString(v) orelse "unknown" else "unknown";
+
+    if (!std.mem.eql(u8, status, "failed")) {
+        if (emit_json) {
+            const payload = .{
+                .status = "ok",
+                .operation = operation,
+                .schema_version = schema,
+                .input = input,
+                .summary = "Report indicates success; no validation failures to explain.",
+            };
+            try printStdout("{f}\n", .{std.json.fmt(payload, .{})});
+        } else {
+            try printStdout("Explain: report status is ok (operation={s}, input={s}, schema={s}).\n", .{ operation, input, schema });
+        }
+        return;
+    }
+
+    const err_obj = jsonGet(root, "error") orelse {
+        return error.InvalidJson;
+    };
+    const message = if (jsonGet(err_obj, "message")) |v| jsonString(v) orelse "unknown error" else "unknown error";
+    const line = if (jsonGet(err_obj, "line")) |v| jsonString(v) orelse "unknown" else "unknown";
+    const read_index = if (jsonGet(err_obj, "read_index")) |v| jsonNumber(v) orelse 0 else 0;
+    const byte_offset = if (jsonGet(err_obj, "byte_offset")) |v| jsonNumber(v) orelse 0 else 0;
+    const hint = inferFailureHint(message);
+
+    if (emit_json) {
+        const payload = .{
+            .status = "failed",
+            .operation = operation,
+            .schema_version = schema,
+            .input = input,
+            .failure = .{
+                .message = message,
+                .line = line,
+                .read_index = read_index,
+                .byte_offset = byte_offset,
+            },
+            .hint = hint,
+        };
+        try printStdout("{f}\n", .{std.json.fmt(payload, .{})});
+    } else {
+        try printStdout(
+            "Explain ({s}):\n- Input: {s}\n- Schema: {s}\n- Failure: {s}\n- Line: {s}\n- Read: {d}\n- Byte: {d}\n- Hint: {s}\n",
+            .{ operation, input, schema, message, line, @as(u64, @intFromFloat(read_index)), @as(u64, @intFromFloat(byte_offset)), hint },
+        );
+    }
+}
+
+fn runCompare(allocator: std.mem.Allocator, before_path: []const u8, after_path: []const u8, emit_json: bool) !void {
+    const before_bytes = try std.fs.cwd().readFileAlloc(allocator, before_path, 8 * 1024 * 1024);
+    defer allocator.free(before_bytes);
+    const after_bytes = try std.fs.cwd().readFileAlloc(allocator, after_path, 8 * 1024 * 1024);
+    defer allocator.free(after_bytes);
+
+    var before_parsed = try std.json.parseFromSlice(std.json.Value, allocator, before_bytes, .{});
+    defer before_parsed.deinit();
+    var after_parsed = try std.json.parseFromSlice(std.json.Value, allocator, after_bytes, .{});
+    defer after_parsed.deinit();
+
+    const b = before_parsed.value;
+    const a = after_parsed.value;
+
+    const b_status = if (jsonGet(b, "status")) |v| jsonString(v) orelse "unknown" else "unknown";
+    const a_status = if (jsonGet(a, "status")) |v| jsonString(v) orelse "unknown" else "unknown";
+    const b_reads = if (jsonGet(b, "total_reads")) |v| jsonNumber(v) orelse 0 else 0;
+    const a_reads = if (jsonGet(a, "total_reads")) |v| jsonNumber(v) orelse 0 else 0;
+    const b_bases = if (jsonGet(b, "total_bases")) |v| jsonNumber(v) orelse 0 else 0;
+    const a_bases = if (jsonGet(a, "total_bases")) |v| jsonNumber(v) orelse 0 else 0;
+    const b_gc = if (jsonGet(b, "gc_percent")) |v| jsonNumber(v) orelse 0 else 0;
+    const a_gc = if (jsonGet(a, "gc_percent")) |v| jsonNumber(v) orelse 0 else 0;
+    const b_q = if (jsonGet(b, "avg_quality")) |v| jsonNumber(v) orelse 0 else 0;
+    const a_q = if (jsonGet(a, "avg_quality")) |v| jsonNumber(v) orelse 0 else 0;
+
+    if (emit_json) {
+        const payload = .{
+            .before = .{ .path = before_path, .status = b_status },
+            .after = .{ .path = after_path, .status = a_status },
+            .delta = .{
+                .total_reads = a_reads - b_reads,
+                .total_bases = a_bases - b_bases,
+                .gc_percent = a_gc - b_gc,
+                .avg_quality = a_q - b_q,
+            },
+        };
+        try printStdout("{f}\n", .{std.json.fmt(payload, .{})});
+        return;
+    }
+
+    try printStdout(
+        "Compare:\n- Before: {s} (status={s})\n- After:  {s} (status={s})\n- Delta reads: {d}\n- Delta bases: {d}\n- Delta GC%%: {d:.4}\n- Delta AvgQ: {d:.4}\n",
+        .{
+            before_path,
+            b_status,
+            after_path,
+            a_status,
+            @as(i64, @intFromFloat(a_reads - b_reads)),
+            @as(i64, @intFromFloat(a_bases - b_bases)),
+            a_gc - b_gc,
+            a_q - b_q,
+        },
+    );
+}
+
 fn loadInputData(allocator: std.mem.Allocator, file: std.fs.File, preference: IoPreference) !LoadedInput {
     const stat = try file.stat();
     const size_u64 = stat.size;
@@ -1752,8 +2331,10 @@ fn validateFastqDetailed(
     show_progress: bool,
     max_errors: usize,
     extract_error_context_path: ?[]const u8,
+    error_window_reads: u64,
+    extract_error_debug_path: ?[]const u8,
 ) !ValidationOutcome {
-    if (max_errors <= 1 and extract_error_context_path == null) {
+    if (max_errors <= 1 and extract_error_context_path == null and extract_error_debug_path == null) {
         const validation = try validateFastq(allocator, data, config, show_progress);
         return .{ .validation = validation };
     }
@@ -1770,7 +2351,10 @@ fn validateFastqDetailed(
         .errors = try allocator.dupe(ValidationError, errors.items),
     };
     if (extract_error_context_path) |path| {
-        out.context_output_path = try writeErrorContextFastq(allocator, data, errors.items[0].read_index, path, 5);
+        out.context_output_path = try writeErrorContextFastq(allocator, data, errors.items[0].read_index, path, error_window_reads);
+    }
+    if (extract_error_debug_path) |path| {
+        try writeErrorDebugReport(data, errors.items[0], path, out.context_output_path);
     }
     return out;
 }
@@ -2154,9 +2738,21 @@ fn validateFastqChunkStrict(
     byte_offset_base: usize,
     profile: WorkProfile,
 ) ValidationResult {
+    return switch (profile) {
+        .full => validateFastqChunkStrictImpl(true, true, chunk, read_index_offset, byte_offset_base),
+        .validate_stats => validateFastqChunkStrictImpl(true, false, chunk, read_index_offset, byte_offset_base),
+        .stats_only => validateFastqChunkStrictImpl(false, false, chunk, read_index_offset, byte_offset_base),
+    };
+}
+
+fn validateFastqChunkStrictImpl(
+    comptime validate_chars: bool,
+    comptime track_low_quality: bool,
+    chunk: []const u8,
+    read_index_offset: u64,
+    byte_offset_base: usize,
+) ValidationResult {
     var stats = Stats{};
-    const validate_chars = profile != .stats_only;
-    const track_low_quality = profile == .full;
     const q_threshold: u64 = @as(u64, @intFromFloat(LOW_QUALITY_AVG_Q_THRESHOLD));
     var scanner = BatchedLineScanner.init(chunk);
     const newline_batch_target: usize = 1024;
@@ -2164,19 +2760,19 @@ fn validateFastqChunkStrict(
     while (scanner.line_start < chunk.len) {
         scanner.fillTo(newline_batch_target);
         if (scanner.available() < 4) {
-            return validateFastqChunkStrictTail(
+            return validateFastqChunkStrictTailImpl(validate_chars, track_low_quality,
                 chunk,
                 scanner.line_start,
                 read_index_offset,
                 byte_offset_base,
-                validate_chars,
-                track_low_quality,
                 q_threshold,
                 &stats,
             );
         }
 
         while (scanner.available() >= 4) {
+            const _frame_start = profileStart();
+            defer profileEnd(.strict_framing, _frame_start);
             const absolute_read_index = read_index_offset + stats.total_reads + 1;
             const header_start = scanner.line_start;
             const nl0 = scanner.peekNewline(0);
@@ -2222,35 +2818,36 @@ fn validateFastqChunkStrict(
                 } };
             }
 
+            if (scanner.available() >= 8) {
+                const prefetch_start = scanner.peekNewline(4) + 1;
+                if (prefetch_start < chunk.len) @prefetch(chunk.ptr + prefetch_start, .{});
+            }
+
             const seq_kernel = analyzeSequenceHot(sequence, validate_chars);
-            if (validate_chars) {
-                if (seq_kernel.invalid_index) |invalid_index| {
-                    return .{ .fail = .{
-                        .read_index = absolute_read_index,
-                        .byte_offset = byte_offset_base + sequence_start + invalid_index,
-                        .issue = .{ .invalid_sequence_char = .{ .ch = sequence[invalid_index] } },
-                    } };
-                }
+            if (validate_chars and seq_kernel.invalid_index != null) {
+                const invalid_index = seq_kernel.invalid_index.?;
+                return .{ .fail = .{
+                    .read_index = absolute_read_index,
+                    .byte_offset = byte_offset_base + sequence_start + invalid_index,
+                    .issue = .{ .invalid_sequence_char = .{ .ch = sequence[invalid_index] } },
+                } };
             }
             stats.gc_bases += seq_kernel.gc_bases;
             stats.total_bases += sequence.len;
 
             const qual_kernel = analyzeQualityHot(quality, validate_chars);
-            if (validate_chars) {
-                if (qual_kernel.invalid_index) |invalid_index| {
-                    return .{ .fail = .{
-                        .read_index = absolute_read_index,
-                        .byte_offset = byte_offset_base + quality_start + invalid_index,
-                        .issue = .{ .invalid_quality_char = .{ .ch = quality[invalid_index] } },
-                    } };
-                }
+            if (validate_chars and qual_kernel.invalid_index != null) {
+                const invalid_index = qual_kernel.invalid_index.?;
+                return .{ .fail = .{
+                    .read_index = absolute_read_index,
+                    .byte_offset = byte_offset_base + quality_start + invalid_index,
+                    .issue = .{ .invalid_quality_char = .{ .ch = quality[invalid_index] } },
+                } };
             }
             stats.quality_sum += qual_kernel.quality_sum;
 
-            if (track_low_quality and quality.len > 0) {
-                if (qual_kernel.quality_sum < q_threshold * quality.len) {
-                    stats.low_quality_reads += 1;
-                }
+            if (track_low_quality and quality.len > 0 and qual_kernel.quality_sum < q_threshold * quality.len) {
+                stats.low_quality_reads += 1;
             }
 
             stats.total_reads += 1;
@@ -2261,13 +2858,13 @@ fn validateFastqChunkStrict(
     return .{ .ok = stats };
 }
 
-fn validateFastqChunkStrictTail(
+fn validateFastqChunkStrictTailImpl(
+    comptime validate_chars: bool,
+    comptime track_low_quality: bool,
     chunk: []const u8,
     start: usize,
     read_index_offset: u64,
     byte_offset_base: usize,
-    validate_chars: bool,
-    track_low_quality: bool,
     q_threshold: u64,
     stats: *Stats,
 ) ValidationResult {
@@ -2368,13 +2965,27 @@ fn validateFastqChunkAssumeValid(
     byte_offset_base: usize,
     profile: WorkProfile,
 ) ValidationResult {
+    return switch (profile) {
+        .full => validateFastqChunkAssumeValidImpl(true, chunk, read_index_offset, byte_offset_base),
+        .validate_stats => validateFastqChunkAssumeValidImpl(false, chunk, read_index_offset, byte_offset_base),
+        .stats_only => validateFastqChunkAssumeValidImpl(false, chunk, read_index_offset, byte_offset_base),
+    };
+}
+
+fn validateFastqChunkAssumeValidImpl(
+    comptime track_low_quality: bool,
+    chunk: []const u8,
+    read_index_offset: u64,
+    byte_offset_base: usize,
+) ValidationResult {
     var stats = Stats{};
-    const track_low_quality = profile == .full;
     const q_threshold: u64 = @as(u64, @intFromFloat(LOW_QUALITY_AVG_Q_THRESHOLD));
     var scanner = BatchedLineScanner.init(chunk);
+    const newline_batch_target: usize = 1024;
 
     while (scanner.line_start < chunk.len) {
-        if (!scanner.hasCompleteRecord()) {
+        scanner.fillTo(newline_batch_target);
+        if (scanner.available() < 4) {
             const read_index = read_index_offset + stats.total_reads + 1;
             return .{ .fail = .{
                 .read_index = read_index,
@@ -2383,68 +2994,72 @@ fn validateFastqChunkAssumeValid(
             } };
         }
 
-        const header_start = scanner.line_start;
-        const nl0 = scanner.peekNewline(0);
-        const nl1 = scanner.peekNewline(1);
-        const nl2 = scanner.peekNewline(2);
-        const nl3 = scanner.peekNewline(3);
-        const sequence_start = nl0 + 1;
-        const plus_start = nl1 + 1;
-        const quality_start = nl2 + 1;
+        while (scanner.available() >= 4) {
+            const _frame_start = profileStart();
+            defer profileEnd(.assume_framing, _frame_start);
+            const header_start = scanner.line_start;
+            const nl0 = scanner.peekNewline(0);
+            const nl1 = scanner.peekNewline(1);
+            const nl2 = scanner.peekNewline(2);
+            const nl3 = scanner.peekNewline(3);
+            const sequence_start = nl0 + 1;
+            const plus_start = nl1 + 1;
+            const quality_start = nl2 + 1;
 
-        if (header_start >= nl0 or chunk[header_start] != '@') {
-            const read_index = read_index_offset + stats.total_reads + 1;
-            return .{ .fail = .{
-                .read_index = read_index,
-                .byte_offset = byte_offset_base + header_start,
-                .issue = .invalid_header_prefix,
-            } };
-        }
-        if (plus_start >= nl2 or chunk[plus_start] != '+') {
-            const read_index = read_index_offset + stats.total_reads + 1;
-            return .{ .fail = .{
-                .read_index = read_index,
-                .byte_offset = byte_offset_base + plus_start,
-                .issue = .invalid_separator_prefix,
-            } };
-        }
+            if (header_start >= nl0 or chunk[header_start] != '@') {
+                const read_index = read_index_offset + stats.total_reads + 1;
+                return .{ .fail = .{
+                    .read_index = read_index,
+                    .byte_offset = byte_offset_base + header_start,
+                    .issue = .invalid_header_prefix,
+                } };
+            }
+            if (plus_start >= nl2 or chunk[plus_start] != '+') {
+                const read_index = read_index_offset + stats.total_reads + 1;
+                return .{ .fail = .{
+                    .read_index = read_index,
+                    .byte_offset = byte_offset_base + plus_start,
+                    .issue = .invalid_separator_prefix,
+                } };
+            }
 
-        var sequence_end = nl1;
-        if (sequence_end > sequence_start and chunk[sequence_end - 1] == '\r') sequence_end -= 1;
-        var quality_end = nl3;
-        if (quality_end > quality_start and chunk[quality_end - 1] == '\r') quality_end -= 1;
-        const sequence = chunk[sequence_start..sequence_end];
-        const quality = chunk[quality_start..quality_end];
+            var sequence_end = nl1;
+            if (sequence_end > sequence_start and chunk[sequence_end - 1] == '\r') sequence_end -= 1;
+            var quality_end = nl3;
+            if (quality_end > quality_start and chunk[quality_end - 1] == '\r') quality_end -= 1;
+            const sequence = chunk[sequence_start..sequence_end];
+            const quality = chunk[quality_start..quality_end];
 
-        if (sequence.len != quality.len) {
-            const read_index = read_index_offset + stats.total_reads + 1;
-            return .{ .fail = .{
-                .read_index = read_index,
-                .byte_offset = byte_offset_base + quality_start,
-                .issue = .{
-                    .sequence_quality_length_mismatch = .{
-                        .sequence_len = sequence.len,
-                        .quality_len = quality.len,
+            if (sequence.len != quality.len) {
+                const read_index = read_index_offset + stats.total_reads + 1;
+                return .{ .fail = .{
+                    .read_index = read_index,
+                    .byte_offset = byte_offset_base + quality_start,
+                    .issue = .{
+                        .sequence_quality_length_mismatch = .{
+                            .sequence_len = sequence.len,
+                            .quality_len = quality.len,
+                        },
                     },
-                },
-            } };
-        }
+                } };
+            }
 
-        if (scanner.available() >= 8) {
-            const prefetch_start = scanner.peekNewline(4) + 1;
-            if (prefetch_start < chunk.len) @prefetch(chunk.ptr + prefetch_start, .{});
-        }
+            if (scanner.available() >= 8) {
+                const prefetch_start = scanner.peekNewline(4) + 1;
+                if (prefetch_start < chunk.len) @prefetch(chunk.ptr + prefetch_start, .{});
+            }
 
-        const fused = analyzeRecordFused(sequence, quality);
-        stats.total_reads += 1;
-        stats.total_bases += sequence.len;
-        stats.gc_bases += fused.gc_bases;
-        stats.quality_sum += fused.quality_sum;
-        if (track_low_quality and quality.len > 0 and fused.quality_sum < q_threshold * quality.len) {
-            stats.low_quality_reads += 1;
-        }
+            const fused = analyzeRecordFused(sequence, quality);
+            stats.total_reads += 1;
+            stats.total_bases += sequence.len;
+            stats.gc_bases += fused.gc_bases;
+            stats.quality_sum += fused.quality_sum;
+            if (track_low_quality and quality.len > 0 and fused.quality_sum < q_threshold * quality.len) {
+                stats.low_quality_reads += 1;
+            }
 
-        scanner.consumeRecord();
+            scanner.consumeRecord();
+        }
     }
 
     return .{ .ok = stats };
@@ -2753,7 +3368,7 @@ fn loadVector(comptime lanes: usize, bytes: []const u8, start: usize) @Vector(la
 
 fn readLine(data: []const u8, cursor: *usize) ?Line {
     const _prof_start = profileStart();
-    defer profileEnd(.read_line, _prof_start);
+    defer profileEnd(.newline_refill, _prof_start);
     if (cursor.* >= data.len) return null;
 
     const start = cursor.*;
@@ -2882,6 +3497,56 @@ fn printValidationFailureDetailed(data: []const u8, fail: ValidationError) !void
     }
 }
 
+fn printGithubAnnotation(input_path: []const u8, fail: ValidationError) !void {
+    var title_buf: [128]u8 = undefined;
+    const title = std.fmt.bufPrint(&title_buf, "FASTQ validation error (read {d})", .{fail.read_index}) catch "FASTQ validation error";
+    var message_buf: [512]u8 = undefined;
+    const message = std.fmt.bufPrint(&message_buf, "{s} (line={s}, byte={d})", .{
+        validationIssueMessage(fail.issue),
+        validationIssueLine(fail.issue),
+        fail.byte_offset,
+    }) catch "validation failed";
+    var escaped_buf: [768]u8 = undefined;
+    const escaped = fillEscapeGithubAnnotation(&escaped_buf, message);
+    try printStderr(
+        "::error file={s},line={d},title={s}::{s}\n",
+        .{ input_path, fail.read_index, title, escaped },
+    );
+}
+
+fn fillEscapeGithubAnnotation(out: []u8, input: []const u8) []const u8 {
+    // Keep this lightweight: we only escape control markers used by GitHub command parser.
+    var w: usize = 0;
+    for (input) |ch| {
+        if (w + 3 >= out.len) break;
+        switch (ch) {
+            '%' => {
+                out[w] = '%';
+                out[w + 1] = '2';
+                out[w + 2] = '5';
+                w += 3;
+            },
+            '\n' => {
+                out[w] = '%';
+                out[w + 1] = '0';
+                out[w + 2] = 'A';
+                w += 3;
+            },
+            '\r' => {
+                out[w] = '%';
+                out[w + 1] = '0';
+                out[w + 2] = 'D';
+                w += 3;
+            },
+            else => {
+                out[w] = ch;
+                w += 1;
+            },
+        }
+    }
+    return out[0..w];
+}
+
 fn lineContextAt(data: []const u8, byte_offset: usize) ?struct { line: []const u8, caret: usize } {
     if (byte_offset >= data.len) return null;
     var start = byte_offset;
@@ -2938,6 +3603,49 @@ fn writeErrorContextFastq(
     return try allocator.dupe(u8, output_path);
 }
 
+fn writeErrorDebugReport(
+    data: []const u8,
+    fail: ValidationError,
+    output_path: []const u8,
+    context_output_path: ?[]const u8,
+) !void {
+    var file = try std.fs.cwd().createFile(output_path, .{ .truncate = true });
+    defer file.close();
+    var out_buf: [4096]u8 = undefined;
+    var file_writer = file.writer(&out_buf);
+    const writer = &file_writer.interface;
+
+    try writer.print("Z-DASH Error Debug Report\n", .{});
+    try writer.print("=========================\n", .{});
+    try writer.print("message: {s}\n", .{validationIssueMessage(fail.issue)});
+    try writer.print("line: {s}\n", .{validationIssueLine(fail.issue)});
+    try writer.print("read_index: {d}\n", .{fail.read_index});
+    try writer.print("byte_offset: {d}\n", .{fail.byte_offset});
+    if (context_output_path) |path| try writer.print("context_fastq: {s}\n", .{path});
+    if (validationBadChar(fail.issue)) |bad| {
+        if (std.ascii.isPrint(bad)) {
+            try writer.print("bad_char: '{c}' (0x{x})\n", .{ bad, bad });
+        } else {
+            try writer.print("bad_char: 0x{x}\n", .{bad});
+        }
+    }
+    if (lineContextAt(data, fail.byte_offset)) |ctx| {
+        try writer.print("line_context: {s}\n", .{ctx.line});
+    }
+
+    const radius: usize = 16;
+    const start = fail.byte_offset -| radius;
+    const end = @min(data.len, fail.byte_offset + radius + 1);
+    try writer.print("hex_window_start: {d}\n", .{start});
+    try writer.print("hex_window_end: {d}\n", .{end});
+    try writer.print("hex_window: ", .{});
+    for (data[start..end]) |b| {
+        try writer.print("{X:0>2} ", .{b});
+    }
+    try writer.print("\n", .{});
+    try writer.flush();
+}
+
 fn inputModeLabel(mode: InputMode) []const u8 {
     return switch (mode) {
         .mmap => "mmap",
@@ -2967,6 +3675,8 @@ fn operationLabel(op: Operation) []const u8 {
         .stats => "stats",
         .repair => "repair",
         .sample => "sample",
+        .explain => "explain",
+        .compare => "compare",
     };
 }
 
@@ -3430,6 +4140,53 @@ test "parse run options supports mode" {
     try std.testing.expect(run.mode == .assume_valid);
 }
 
+test "parse run options supports preset" {
+    const args = [_][]const u8{ "zdash", "--preset=fast-scan", "in.fastq" };
+    const run = try parseRunOptions(&args);
+    try std.testing.expect(run.operation == .scan);
+    try std.testing.expect(run.mode == .assume_valid);
+    try std.testing.expect(run.profile == .validate_stats);
+    try std.testing.expect(run.profile_explicit);
+}
+
+test "parse run options rejects unsupported json schema version" {
+    const args = [_][]const u8{ "zdash", "--json", "--json-schema-version=9.9.9", "in.fastq" };
+    try std.testing.expectError(error.InvalidUsage, parseRunOptions(&args));
+}
+
+test "parse run options requires --against for compare" {
+    const args = [_][]const u8{ "zdash", "compare", "before.json" };
+    try std.testing.expectError(error.InvalidUsage, parseRunOptions(&args));
+}
+
+test "parse run options supports compare with against and debug context options" {
+    const args = [_][]const u8{
+        "zdash",
+        "compare",
+        "--against=after.json",
+        "--extract-error-debug=debug.txt",
+        "--error-window-reads=9",
+        "before.json",
+    };
+    const run = try parseRunOptions(&args);
+    try std.testing.expect(run.operation == .compare);
+    try std.testing.expectEqualStrings("after.json", run.compare_against_path.?);
+    try std.testing.expectEqualStrings("debug.txt", run.extract_error_debug_path.?);
+    try std.testing.expectEqual(@as(u64, 9), run.error_window_reads);
+}
+
+test "config option parser applies preset and booleans" {
+    var run = RunOptions{ .input_path = "" };
+    try applyConfigOption(&run, "preset", "qc-only");
+    try applyConfigOption(&run, "json", "true");
+    try applyConfigOption(&run, "gha_annotations", "true");
+    try std.testing.expect(run.operation == .stats);
+    try std.testing.expect(run.mode == .assume_valid);
+    try std.testing.expect(run.profile == .stats_only);
+    try std.testing.expect(run.json);
+    try std.testing.expect(run.gha_annotations);
+}
+
 test "parse run options supports subcommand defaults" {
     const args = [_][]const u8{ "zdash", "stats", "in.fastq" };
     const run = try parseRunOptions(&args);
@@ -3520,7 +4277,7 @@ test "max-errors collects multiple failures from fixture" {
         .profile = .full,
         .mode = .strict,
     };
-    const outcome = try validateFastqDetailed(std.testing.allocator, bad, cfg, false, 2, null);
+    const outcome = try validateFastqDetailed(std.testing.allocator, bad, cfg, false, 2, null, 5, null);
     defer outcome.deinit(std.testing.allocator);
     try std.testing.expect(outcome.validation == .fail);
     try std.testing.expectEqual(@as(usize, 2), outcome.errors.len);

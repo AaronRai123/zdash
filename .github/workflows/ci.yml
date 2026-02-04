@@ -28,7 +28,9 @@ jobs:
           IIII
           EOF
           ./zig-out/bin/zdash check --json /tmp/smoke.fastq
+          ./zig-out/bin/zdash check --json --json-schema-version 1.0.0 /tmp/smoke.fastq
           ./zig-out/bin/zdash scan --json /tmp/smoke.fastq
           ./zig-out/bin/zdash stats --json /tmp/smoke.fastq
           ./zig-out/bin/zdash sample --seed 1 --n 1 /tmp/smoke.fastq > /tmp/sample.fastq
+          ./zig-out/bin/zdash sample --json --seed 1 --n 1 --output /tmp/sample_json.fastq /tmp/smoke.fastq > /tmp/sample.json
           ./zig-out/bin/zdash repair --output /tmp/repaired.fastq /tmp/smoke.fastq

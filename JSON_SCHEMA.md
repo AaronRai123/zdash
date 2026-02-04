@@ -13,12 +13,18 @@ Compatibility policy:
 - Minor (`1.x.0`): additive changes allowed; existing fields remain stable.
 - Major (`x.0.0`): breaking changes allowed (field renames/removals/type changes).
 
+Runtime contract check:
+
+- `--json-schema-version <v>` requires an exact schema version match.
+- Current supported value is `1.0.0`.
+- Mismatches fail fast with usage error (`2`).
+
 ## Common Top-Level Fields
 
 - `tool` (string)
 - `version` (string, binary version)
 - `schema_version` (string, JSON contract version)
-- `operation` (string: `check|scan|stats|repair|sample`)
+- `operation` (string: `check|scan|stats|repair|sample|explain|compare`)
 - `status` (string: `ok|failed`)
 
 ## Validation/Stats Success Payload
@@ -64,3 +70,7 @@ Additional fields:
 - `fraction` (number or null)
 - `n` (number or null)
 - `output_path` (string path; required when `--json` is used)
+
+## Changelog Discipline
+
+- Record schema-visible changes in `JSON_SCHEMA_CHANGELOG.md` before release.

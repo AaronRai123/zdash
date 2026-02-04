@@ -21,7 +21,7 @@ Roadmap and task tracking live in `TODO.md`.
 ## CLI
 
 ```bash
-zdash <check|scan|stats|repair|sample> [options] <input.fastq>
+zdash <check|scan|stats|repair|sample|explain|compare> [options] <input>
 
 # strict validation + stats
 zdash check sample.fastq
@@ -35,6 +35,12 @@ zdash stats sample.fastq
 # machine-readable output for CI/pipelines
 zdash check --json sample.fastq
 zdash check --report-json zdash_report.json sample.fastq
+zdash check --json --json-schema-version 1.0.0 sample.fastq
+zdash check --gha-annotations sample.fastq
+
+# preset + config driven runs
+zdash --preset strict-ci sample.fastq
+zdash --config .zdash.example.toml sample.fastq
 
 # gzip/bgzip input
 zdash check sample.fastq.gz
@@ -57,6 +63,12 @@ zdash sample --seed 42 --n 100000 --output sample_100k.fastq sample.fastq
 
 # sample JSON summary (requires file output)
 zdash sample --json --seed 42 --n 100000 --output sample_100k.fastq sample.fastq
+
+# explain a JSON report with actionable hints
+zdash explain zdash_report.json
+
+# compare two JSON reports
+zdash compare --against after_report.json before_report.json
 ```
 
 Validation errors are developer-friendly:
@@ -103,11 +115,13 @@ Milestones are tracked in `TODO.md`:
 
 Latest benchmark notes and result tables are tracked in `benchmarks.md`.
 Current competitive focus compares `zdash-check`, `zdash-scan`, and `zdash-stats` against `seqtk`, `seqkit`, `fastp`, and a `noodles` benchmark binary.
+Use `scripts/perf_validate.sh` to run a quick throughput + accuracy validation pass (reports p50/p90 timings and throughput).
 
 ## JSON Contract
 
 - JSON outputs (`--json`, `--report-json`) follow a versioned schema.
 - See `JSON_SCHEMA.md` for compatibility guarantees and field definitions.
+- `--json-schema-version <v>` enforces an exact schema version at runtime.
 
 ## Data Source Support
 
