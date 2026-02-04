@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: 0.15.2
+      - name: Unit Tests
+        run: zig build test
+      - name: Release Build
+        run: zig build -Doptimize=ReleaseFast
+      - name: Smoke CLI
+        run: |
+          cat > /tmp/smoke.fastq <<'EOF'
+          @r1
+          ACGT
+          +
+          IIII
+          EOF
+          ./zig-out/bin/zdash check --json /tmp/smoke.fastq
+          ./zig-out/bin/zdash scan --json /tmp/smoke.fastq
+          ./zig-out/bin/zdash stats --json /tmp/smoke.fastq
+          ./zig-out/bin/zdash sample --seed 1 --n 1 /tmp/smoke.fastq > /tmp/sample.fastq
+          ./zig-out/bin/zdash repair --output /tmp/repaired.fastq /tmp/smoke.fastq

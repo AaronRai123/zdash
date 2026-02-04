@@ -1,0 +1,8 @@
+.zig-cache/
+zig-out/
+
+# Large local benchmark datasets
+data/hg002/
+
+# macOS
+.DS_Store
