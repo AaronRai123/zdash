@@ -1,0 +1,61 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_suffix: linux-x86_64
+          - os: macos-latest
+            artifact_suffix: macos-aarch64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.15.2
+      - name: Build Release Binary
+        run: zig build -Doptimize=ReleaseFast
+      - name: Package Artifact
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          OUT_DIR="dist"
+          PKG_DIR="zdash-${VERSION}-${{ matrix.artifact_suffix }}"
+          mkdir -p "$OUT_DIR/$PKG_DIR"
+          cp zig-out/bin/zdash "$OUT_DIR/$PKG_DIR/zdash"
+          cp LICENSE "$OUT_DIR/$PKG_DIR/LICENSE"
+          cp README.md "$OUT_DIR/$PKG_DIR/README.md"
+          tar -C "$OUT_DIR" -czf "$OUT_DIR/${PKG_DIR}.tar.gz" "$PKG_DIR"
+          shasum -a 256 "$OUT_DIR/${PKG_DIR}.tar.gz" > "$OUT_DIR/${PKG_DIR}.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_suffix }}
+          path: dist/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Flatten Artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          find dist -type f -maxdepth 3 -exec cp {} release/ \;
+          cat release/*.sha256 > release/checksums.txt
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/*.tar.gz
+            release/checksums.txt

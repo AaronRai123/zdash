@@ -621,3 +621,14 @@ Recommended next direction:
 Project rule requested by owner:
 
 - Update `documentation.md` after every meaningful code change so docs stay synchronized with implementation.
+
+## 17. Distribution
+
+- GitHub Release workflow: `.github/workflows/release.yml`
+  - builds macOS (aarch64) and Linux (x86_64) release archives on `v*` tags
+  - uploads archives and `checksums.txt` as release assets
+- Installer script: `scripts/install.sh`
+  - downloads latest release archive for current platform and installs `zdash` to `$HOME/.local/bin` by default
+- Homebrew formula template: `Formula/zdash.rb`
+  - intended for `AaronRai123/tap` (`brew install AaronRai123/tap/zdash`)
+  - replace `sha256` placeholders with release artifact checksums before tap publish
