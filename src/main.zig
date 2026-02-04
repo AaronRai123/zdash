@@ -41,6 +41,11 @@ const IoPreference = enum {
     buffered,
 };
 
+const GzipMode = enum {
+    stream,
+    temp,
+};
+
 const WorkProfile = enum {
     full,
     validate_stats,
@@ -78,6 +83,7 @@ const RunOptions = struct {
     operation_explicit: bool = false,
     input_path: []const u8,
     io_preference: IoPreference = .auto,
+    gzip_mode: GzipMode = .stream,
     preset: ?Preset = null,
     config_path: ?[]const u8 = null,
     show_progress: bool = false,
@@ -373,12 +379,13 @@ const ChunkQueue = struct {
             const tail = self.tail.load(.acquire);
             const head = self.head.load(.acquire);
             if (tail >= head) {
-                const wait_start = profileStart();
+                const wait_prof_enabled = g_profiler.enabled;
+                const wait_start = if (wait_prof_enabled) std.time.nanoTimestamp() else 0;
                 if (self.done.load(.acquire)) {
-                    profileEnd(.queue_wait, wait_start);
+                    if (wait_prof_enabled) profileEnd(.queue_wait, wait_start);
                     return null;
                 }
-                profileEnd(.queue_wait, wait_start);
+                if (wait_prof_enabled) profileEnd(.queue_wait, wait_start);
                 std.Thread.yield() catch {};
                 continue;
             }
@@ -475,7 +482,7 @@ pub fn main() !void {
     }
     const config = resolveProcessingConfig(run_options);
     const input_path = run_options.input_path;
-    const loaded = loadInputFromPath(std.heap.page_allocator, input_path, run_options.io_preference) catch |err| {
+    const loaded = loadInputFromPath(std.heap.page_allocator, input_path, run_options.io_preference, run_options.gzip_mode) catch |err| {
         try printStderr("error: failed to load '{s}': {s}\n", .{ input_path, @errorName(err) });
         std.process.exit(@intFromEnum(ExitCode.io_error));
     };
@@ -626,6 +633,8 @@ fn printUsage(to_stderr: bool) !void {
             \\  --bench                   Run full pipeline benchmark mode
             \\  --io-mode <auto|mmap|buffered>
             \\                            Force I/O mode (default: auto)
+            \\  --gzip-mode <stream|temp>
+            \\                            gzip/bgzip path (default: stream; temp preserves legacy flow)
             \\  --bench-kernels           Run SIMD/scalar kernel microbenchmarks
             \\  --profile-internal        Print internal function timing counters
             \\
@@ -673,6 +682,8 @@ fn printUsage(to_stderr: bool) !void {
         \\  --bench                   Run full pipeline benchmark mode
         \\  --io-mode <auto|mmap|buffered>
         \\                            Force I/O mode (default: auto)
+        \\  --gzip-mode <stream|temp>
+        \\                            gzip/bgzip path (default: stream; temp preserves legacy flow)
         \\  --bench-kernels           Run SIMD/scalar kernel microbenchmarks
         \\  --profile-internal        Print internal function timing counters
         \\
@@ -946,6 +957,10 @@ fn applyConfigOption(run: *RunOptions, key: []const u8, value: []const u8) !void
     }
     if (std.mem.eql(u8, key, "io_mode")) {
         run.io_preference = try parseIoPreference(value);
+        return;
+    }
+    if (std.mem.eql(u8, key, "gzip_mode")) {
+        run.gzip_mode = try parseGzipMode(value);
         return;
     }
     if (std.mem.eql(u8, key, "threads")) {
@@ -1281,6 +1296,18 @@ fn parseRunOptions(args: []const []const u8) !RunOptions {
             };
             continue;
         }
+        if (std.mem.eql(u8, arg, "--gzip-mode")) {
+            if (i + 1 >= args.len) {
+                try printError("error: --gzip-mode requires a value\n");
+                return error.InvalidUsage;
+            }
+            i += 1;
+            run.gzip_mode = parseGzipMode(args[i]) catch {
+                try printStderr("error: invalid gzip mode '{s}'\n", .{args[i]});
+                return error.InvalidUsage;
+            };
+            continue;
+        }
 
         if (std.mem.eql(u8, arg, "--threads")) {
             if (i + 1 >= args.len) {
@@ -1340,6 +1367,14 @@ fn parseRunOptions(args: []const []const u8) !RunOptions {
             const value = arg["--io-mode=".len..];
             run.io_preference = parseIoPreference(value) catch {
                 try printStderr("error: invalid io mode '{s}'\n", .{value});
+                return error.InvalidUsage;
+            };
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--gzip-mode=")) {
+            const value = arg["--gzip-mode=".len..];
+            run.gzip_mode = parseGzipMode(value) catch {
+                try printStderr("error: invalid gzip mode '{s}'\n", .{value});
                 return error.InvalidUsage;
             };
             continue;
@@ -1574,6 +1609,12 @@ fn parseIoPreference(value: []const u8) !IoPreference {
     if (std.mem.eql(u8, value, "mmap")) return .mmap;
     if (std.mem.eql(u8, value, "buffered")) return .buffered;
     return error.InvalidIoPreference;
+}
+
+fn parseGzipMode(value: []const u8) !GzipMode {
+    if (std.mem.eql(u8, value, "stream")) return .stream;
+    if (std.mem.eql(u8, value, "temp")) return .temp;
+    return error.InvalidGzipMode;
 }
 
 fn parseThreadCount(value: []const u8) !usize {
@@ -1881,7 +1922,12 @@ fn printStderr(comptime fmt: []const u8, args: anytype) !void {
     try out.flush();
 }
 
-fn loadInputFromPath(allocator: std.mem.Allocator, input_path: []const u8, preference: IoPreference) !LoadedInput {
+fn loadInputFromPath(
+    allocator: std.mem.Allocator,
+    input_path: []const u8,
+    preference: IoPreference,
+    gzip_mode: GzipMode,
+) !LoadedInput {
     if (std.mem.eql(u8, input_path, "-")) {
         const bytes = try readStdinAll(allocator);
         return .{
@@ -1894,6 +1940,17 @@ fn loadInputFromPath(allocator: std.mem.Allocator, input_path: []const u8, prefe
     }
 
     if (isGzipPath(input_path)) {
+        if (gzip_mode == .stream) {
+            const bytes = try decompressGzipToMemory(allocator, input_path);
+            return .{
+                .bytes = bytes,
+                .mode = .buffered,
+                .file_size = bytes.len,
+                .file_kind = .file,
+                .backing = .{ .owned = bytes },
+            };
+        }
+
         const temp_path = try decompressGzipToTempFile(allocator, input_path);
         var file = try std.fs.cwd().openFile(temp_path, .{});
         defer file.close();
@@ -1914,6 +1971,20 @@ fn isGzipPath(path: []const u8) bool {
 fn readStdinAll(allocator: std.mem.Allocator) ![]u8 {
     var file = std.fs.File.stdin();
     return file.readToEndAlloc(allocator, std.math.maxInt(usize));
+}
+
+fn decompressGzipToMemory(allocator: std.mem.Allocator, input_path: []const u8) ![]u8 {
+    var in_file = try std.fs.cwd().openFile(input_path, .{});
+    defer in_file.close();
+    var in_buf: [64 * 1024]u8 = undefined;
+    var in_reader = in_file.reader(&in_buf);
+    var flate_buf: [std.compress.flate.max_window_len]u8 = undefined;
+    var decompress = std.compress.flate.Decompress.init(&in_reader.interface, .gzip, &flate_buf);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    _ = try decompress.reader.streamRemaining(&out.writer);
+    return try out.toOwnedSlice();
 }
 
 fn decompressGzipToTempFile(allocator: std.mem.Allocator, input_path: []const u8) ![]u8 {
@@ -2771,8 +2842,8 @@ fn validateFastqChunkStrictImpl(
         }
 
         while (scanner.available() >= 4) {
-            const _frame_start = profileStart();
-            defer profileEnd(.strict_framing, _frame_start);
+            const frame_prof_enabled = g_profiler.enabled;
+            const frame_start = if (frame_prof_enabled) std.time.nanoTimestamp() else 0;
             const absolute_read_index = read_index_offset + stats.total_reads + 1;
             const header_start = scanner.line_start;
             const nl0 = scanner.peekNewline(0);
@@ -2822,6 +2893,7 @@ fn validateFastqChunkStrictImpl(
                 const prefetch_start = scanner.peekNewline(4) + 1;
                 if (prefetch_start < chunk.len) @prefetch(chunk.ptr + prefetch_start, .{});
             }
+            if (frame_prof_enabled) profileEnd(.strict_framing, frame_start);
 
             const seq_kernel = analyzeSequenceHot(sequence, validate_chars);
             if (validate_chars and seq_kernel.invalid_index != null) {
@@ -2995,8 +3067,8 @@ fn validateFastqChunkAssumeValidImpl(
         }
 
         while (scanner.available() >= 4) {
-            const _frame_start = profileStart();
-            defer profileEnd(.assume_framing, _frame_start);
+            const frame_prof_enabled = g_profiler.enabled;
+            const frame_start = if (frame_prof_enabled) std.time.nanoTimestamp() else 0;
             const header_start = scanner.line_start;
             const nl0 = scanner.peekNewline(0);
             const nl1 = scanner.peekNewline(1);
@@ -3048,6 +3120,7 @@ fn validateFastqChunkAssumeValidImpl(
                 const prefetch_start = scanner.peekNewline(4) + 1;
                 if (prefetch_start < chunk.len) @prefetch(chunk.ptr + prefetch_start, .{});
             }
+            if (frame_prof_enabled) profileEnd(.assume_framing, frame_start);
 
             const fused = analyzeRecordFused(sequence, quality);
             stats.total_reads += 1;
@@ -4119,6 +4192,12 @@ test "parse run options supports quiet and chunk bytes" {
     try std.testing.expectEqual(@as(usize, 4), run.threads);
     try std.testing.expectEqual(@as(usize, 1024), run.chunk_bytes);
     try std.testing.expectEqualStrings("in.fastq", run.input_path);
+}
+
+test "parse run options supports gzip mode" {
+    const args = [_][]const u8{ "zdash", "--gzip-mode=temp", "in.fastq.gz" };
+    const run = try parseRunOptions(&args);
+    try std.testing.expect(run.gzip_mode == .temp);
 }
 
 test "parse run options supports max-errors and context path" {

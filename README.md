@@ -44,6 +44,9 @@ zdash --config .zdash.example.toml sample.fastq
 
 # gzip/bgzip input
 zdash check sample.fastq.gz
+zdash check --gzip-mode stream sample.fastq.gz
+# use legacy temp-file bridge only if needed for compatibility
+zdash check --gzip-mode temp sample.fastq.gz
 
 # stream from stdin
 cat sample.fastq | zdash stats --json -
@@ -126,7 +129,7 @@ Use `scripts/perf_validate.sh` to run a quick throughput + accuracy validation p
 ## Data Source Support
 
 - Uncompressed FASTQ: `*.fastq`
-- Gzip/bgzip FASTQ: `*.gz`, `*.bgz` (integrated decode path)
+- Gzip/bgzip FASTQ: `*.gz`, `*.bgz` (default in-memory stream decode; `--gzip-mode temp` for legacy temp-file flow)
 - Stdin stream: `-`
 
 ## CI

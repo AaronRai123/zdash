@@ -9,6 +9,7 @@ Quick production usage patterns.
   - `zdash check --json --gha-annotations input.fastq` (for GitHub Actions logs)
 - Fast health scan:
   - `zdash scan --json input.fastq.gz`
+  - `zdash scan --json --gzip-mode stream input.fastq.gz`
 - Stats-only run:
   - `zdash stats --json input.fastq`
 
@@ -45,6 +46,10 @@ Quick production usage patterns.
 - FASTQ file: `input.fastq`
 - gzip/bgzip: `input.fastq.gz`, `input.fastq.bgz`
 - stdin: `-` (example: `cat input.fastq | zdash stats --json -`)
+- gzip mode:
+  - `--gzip-mode stream` (default, in-memory decode)
+  - `--gzip-mode temp` (legacy temp-file bridge)
+  - expect `stream` to be substantially faster on large `.gz` inputs since it avoids temp-file write+read.
 
 ## Presets + Config
 

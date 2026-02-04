@@ -7,6 +7,7 @@ preset = strict-ci
 # Optional overrides
 threads = 8
 chunk_bytes = 8388608
+gzip_mode = stream
 json = true
 gha_annotations = true
 json_schema_version = "1.0.0"

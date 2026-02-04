@@ -53,11 +53,29 @@ for mode, cmd in cmds.items():
     print(f"{mode},{med:.6f},{p90s:.6f},{(size_gib/med):.6f},{(size_gib/p90s):.6f}," + ";".join(f"{x:.6f}" for x in ts))
 PY
 
+if [[ -f "${FASTQ}.gz" ]]; then
+  echo
+  echo "=== Gzip Mode Check (${FASTQ}.gz) ==="
+  python3 - <<'PY' "${FASTQ}.gz" "$THREADS"
+import subprocess,time,sys
+gz=sys.argv[1]
+threads=int(sys.argv[2])
+for mode in ("temp","stream"):
+    cmd=f"./zig-out/bin/zdash check --quiet --threads={threads} --gzip-mode {mode} {gz} > /dev/null 2>&1"
+    t0=time.perf_counter()
+    subprocess.run(cmd,shell=True,check=True)
+    t1=time.perf_counter()
+    print(f"{mode},{t1-t0:.6f}")
+PY
+fi
+
 echo
 echo "=== Accuracy Checks ==="
 ./zig-out/bin/zdash check --json tests/fixtures/valid_small.fastq > "$TMP_DIR/check.json"
 ./zig-out/bin/zdash scan --json tests/fixtures/valid_small.fastq > "$TMP_DIR/scan.json"
 ./zig-out/bin/zdash stats --json tests/fixtures/valid_small.fastq > "$TMP_DIR/stats.json"
+gzip -c tests/fixtures/valid_small.fastq > "$TMP_DIR/valid_small.fastq.gz"
+./zig-out/bin/zdash check --json --gzip-mode stream "$TMP_DIR/valid_small.fastq.gz" > "$TMP_DIR/check_gz.json"
 set +e
 ./zig-out/bin/zdash check --json --max-errors 2 tests/fixtures/bad_two_errors.fastq > "$TMP_DIR/bad.json"
 EC=$?
@@ -66,17 +84,21 @@ if [[ "$EC" -ne 4 ]]; then
   echo "accuracy check failed: expected bad fixture exit 4, got $EC" >&2
   exit 1
 fi
-python3 - <<'PY' "$TMP_DIR/check.json" "$TMP_DIR/scan.json" "$TMP_DIR/stats.json" "$TMP_DIR/bad.json"
+python3 - <<'PY' "$TMP_DIR/check.json" "$TMP_DIR/scan.json" "$TMP_DIR/stats.json" "$TMP_DIR/check_gz.json" "$TMP_DIR/bad.json"
 import json, sys
 c = json.load(open(sys.argv[1]))
 s = json.load(open(sys.argv[2]))
 t = json.load(open(sys.argv[3]))
-b = json.load(open(sys.argv[4]))
+g = json.load(open(sys.argv[4]))
+b = json.load(open(sys.argv[5]))
 assert c["status"] == "ok"
 assert s["status"] == "ok"
 assert t["status"] == "ok"
+assert g["status"] == "ok"
 assert c["total_reads"] == s["total_reads"] == t["total_reads"]
 assert c["total_bases"] == s["total_bases"] == t["total_bases"]
+assert c["total_reads"] == g["total_reads"]
+assert c["total_bases"] == g["total_bases"]
 assert b["status"] == "failed"
 print("accuracy_ok=true")
 PY

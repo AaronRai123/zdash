@@ -10,7 +10,7 @@ The code currently implements:
 - user-facing command modes (`check`, `scan`, `stats`)
 - additional command modes (`repair`, `sample`)
 - FASTQ input loading with selectable I/O mode (`auto`, `mmap`, `buffered`)
-- gzip/bgzip input decompression support via integrated `std.compress.flate` decode into a temporary FASTQ
+- gzip/bgzip input decompression support via integrated `std.compress.flate` decode (default in-memory stream mode, optional temp-file mode)
 - stdin input support (`-`)
 - Runtime tuning flags (`--threads`, `--chunk-bytes`)
 - Work profile selection (`--profile`)
@@ -26,6 +26,7 @@ The code currently implements:
 - Unit and integration tests in the same source file
 
 Primary implementation file: `src/main.zig`
+
 
 ## 2. High-Level Flow
 
@@ -185,6 +186,8 @@ Supported options:
 - `--n <N>`, `--n=<N>`
 - `--io-mode <auto|mmap|buffered>`
 - `--io-mode=<auto|mmap|buffered>`
+- `--gzip-mode <stream|temp>`
+- `--gzip-mode=<stream|temp>`
 - `--bench-kernels`
 - `--bench`
 - `--profile-internal`
@@ -207,7 +210,7 @@ Commands:
 Input path behavior:
 
 - regular path: direct load (`mmap` preferred)
-- `.gz` / `.bgz`: decompressed to temp FASTQ then processed
+- `.gz` / `.bgz`: default in-memory stream decode then processed (`--gzip-mode temp` keeps temp-file bridge)
 - `-`: reads FASTQ from stdin into buffered memory
 
 Input path is required and must be exactly one positional argument.
@@ -282,7 +285,13 @@ Sample behavior:
 
 ## 5. I/O Model
 
-Implemented in `loadInputData(...)`.
+Implemented in `loadInputFromPath(...)` and `loadInputData(...)`.
+
+### Gzip/bgzip mode
+
+- `--gzip-mode stream` (default): decode `.gz`/`.bgz` directly into in-memory FASTQ bytes.
+- `--gzip-mode temp`: decode into a temporary FASTQ file, then use existing file-loading path.
+- stream mode avoids temp-file write/read overhead and is usually much faster on large compressed inputs.
 
 ### Auto mode
 
@@ -583,7 +592,7 @@ zig-out/bin/zdash --bench --threads=8 --chunk-bytes=8388608 input.fastq
 Current limitations:
 
 - reads full file into memory in buffered mode
-- gzip/bgzip path currently decompresses to temporary FASTQ before processing (not fully streaming decode)
+- gzip/bgzip in-memory decode currently buffers full decompressed payload (bounded-memory streaming still pending)
 - parser and tests still co-located in `src/main.zig` (needs modular split)
 - JSON schema is versioned, but formal change-log discipline must be maintained during releases
 

@@ -28,6 +28,8 @@ jobs:
           IIII
           EOF
           ./zig-out/bin/zdash check --json /tmp/smoke.fastq
+          gzip -c /tmp/smoke.fastq > /tmp/smoke.fastq.gz
+          ./zig-out/bin/zdash check --json --gzip-mode stream /tmp/smoke.fastq.gz
           ./zig-out/bin/zdash check --json --json-schema-version 1.0.0 /tmp/smoke.fastq
           ./zig-out/bin/zdash scan --json /tmp/smoke.fastq
           ./zig-out/bin/zdash stats --json /tmp/smoke.fastq
